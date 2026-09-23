@@ -149,9 +149,10 @@ def expiry_risk(conn: psycopg.Connection, *, include_normal: bool = True) -> lis
         units_consumed       = clamp(demand_before_expiry - units in earlier batches, 0, qty)
         units_at_risk        = qty - units_consumed
 
-    Risk level: EXPIRED (already expired), HIGH (>= 50% of the batch at
-    risk, or any units at risk and expiry within the urgent threshold),
-    MEDIUM (some units at risk), LOW (none projected).
+    Risk level: EXPIRED (already expired); HIGH (units at risk and expiry
+    within the urgent threshold, or >= 50% of the batch at risk and expiry
+    within the approaching threshold); MEDIUM (units at risk further out -
+    likely dead stock if demand does not change); LOW (none projected).
     """
     thresholds = app_settings.expiry_thresholds(conn)
     usage = inventory.consumption(conn)
@@ -180,7 +181,7 @@ def expiry_risk(conn: psycopg.Connection, *, include_normal: bool = True) -> lis
                 share = at_risk / qty if qty else 0
                 if at_risk == 0:
                     level = "LOW"
-                elif share >= 0.5 or days <= thresholds.urgent_days:
+                elif days <= thresholds.urgent_days or (share >= 0.5 and days <= thresholds.approaching_days):
                     level = "HIGH"
                 else:
                     level = "MEDIUM"

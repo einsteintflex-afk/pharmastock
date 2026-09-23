@@ -159,3 +159,15 @@ def test_csv_formula_injection_neutralised(api):
 def test_export_is_audited(db):
     row = db.execute("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'EXPORT'").fetchone()
     assert row["n"] >= 3 * len(reports.REPORTS)
+
+
+def test_distant_unmoving_stock_is_medium_not_high(api):
+    """A batch with no demand is at risk, but only HIGH when expiry is near."""
+    medicine = api.post("/medicines", {"name": "Risk Horizon", "strength": "1 mg", "dosage_form": "Tablet"}).json()
+    api.post("/batches", {"medicine_id": medicine["id"], "batch_number": "RH-FAR", "quantity": 10,
+                          "expiry_date": _day(600), "unit_cost": 1})
+    api.post("/batches", {"medicine_id": medicine["id"], "batch_number": "RH-NEAR", "quantity": 10,
+                          "expiry_date": _day(150), "unit_cost": 1})
+    rows = {r["batch_number"]: r for r in api.get("/analytics/expiry-risk").json()["batches"]}
+    assert rows["RH-FAR"]["risk_level"] == "MEDIUM" and rows["RH-FAR"]["projected_units_at_risk"] == 10
+    assert rows["RH-NEAR"]["risk_level"] == "HIGH"
