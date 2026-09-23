@@ -1,0 +1,14 @@
+# HTTPS reverse proxy. Caddy obtains and renews certificates automatically
+# for a public DOMAIN; for "localhost" it uses its own local CA.
+{$DOMAIN:localhost} {
+    encode gzip
+    # Only the application; the database is never exposed.
+    reverse_proxy app:8000
+    header {
+        -Server
+    }
+    log {
+        output stdout
+        format json
+    }
+}

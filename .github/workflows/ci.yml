@@ -1,0 +1,103 @@
+# Continuous integration: backend tests against PostgreSQL, frontend checks,
+# browser end-to-end test, Docker image build. Runs on every push and PR.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pharma
+          POSTGRES_PASSWORD: pharma_dev
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pharma" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://pharma:pharma_dev@localhost:5432/pharmastock_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements-dev.txt
+      - name: Compile
+        run: python -m compileall -q backend
+      - name: Tests (run as a non-superuser role so row level security is enforced)
+        run: |
+          # The service superuser creates an ordinary role for the tests.
+          PGPASSWORD=pharma_dev psql -h localhost -U pharma -d postgres -c \
+            "CREATE ROLE tester LOGIN PASSWORD 'tester' CREATEDB NOSUPERUSER NOBYPASSRLS"
+          TEST_DATABASE_URL=postgresql://tester:tester@localhost:5432/pharmastock_test pytest -q -p no:warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: JavaScript syntax
+        run: for f in frontend/js/*.js frontend/js/pages/*.js frontend/sw.js tests/e2e/*.mjs; do cp "$f" /tmp/c.mjs; node --check /tmp/c.mjs || exit 1; done
+      - name: No duplicate function declarations
+        run: |
+          for f in frontend/js/*.js frontend/js/pages/*.js; do
+            d=$(grep -oE "^(export )?(async )?function [A-Za-z0-9_]+" "$f" | awk '{print $NF}' | sort | uniq -d)
+            if [ -n "$d" ]; then echo "$f: duplicate $d"; exit 1; fi
+          done
+
+  e2e:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    env:
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: pip install -r requirements.txt
+      - name: Database with the project test data
+        run: |
+          psql -h localhost -U postgres -c "CREATE ROLE pharma LOGIN PASSWORD 'pharma_dev' NOSUPERUSER NOBYPASSRLS"
+          psql -h localhost -U postgres -c "CREATE DATABASE pharmastock OWNER pharma"
+          grep -v -E '^\\(un)?restrict|transaction_timeout' db_schema.sql | PGPASSWORD=pharma_dev psql -q -h localhost -U pharma -d pharmastock
+          grep -v -E '^\\(un)?restrict|transaction_timeout' db_testdata.sql | PGPASSWORD=pharma_dev psql -q -h localhost -U pharma -d pharmastock
+          DATABASE_URL=postgresql://pharma:pharma_dev@localhost/pharmastock python -m backend.migrate
+      - name: Start server
+        run: |
+          DATABASE_URL=postgresql://pharma:pharma_dev@localhost/pharmastock \
+          BOOTSTRAP_ADMIN_USERNAME=admin BOOTSTRAP_ADMIN_PASSWORD=Ci-first-pass-2026 \
+          nohup uvicorn backend.main:app --port 8000 > server.log 2>&1 &
+          for i in $(seq 30); do curl -fs localhost:8000/ready && break; sleep 1; done
+      - name: Browser end-to-end test
+        run: |
+          npm install --no-save playwright@1
+          npx playwright install --with-deps chromium
+          mkdir -p shots
+          ADMIN_USER=admin ADMIN_PASSWORD=Ci-first-pass-2026 node tests/e2e/ui_e2e.mjs shots
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: e2e-screenshots, path: "shots\nserver.log" }
+
+  docker:
+    needs: [backend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t pharmastock:ci .
+      - name: Compose file is valid
+        run: |
+          cp deploy/env.production.example .env.production
+          docker compose --env-file .env.production config -q
