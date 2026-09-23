@@ -62,6 +62,7 @@ class PurchaseReceiptCreate(BaseModel):
     received_by: Name150 | None = None
     notes: LongText | None = None
     location_id: int | None = None
+    barcode_data: str | None = Field(default=None, max_length=200)
 
 
 def _lock_order(conn, order_id: int) -> dict:
@@ -276,10 +277,12 @@ def add_purchase_order_item(purchase_order_id: int, item: PurchaseOrderItemCreat
         raise HTTPException(status_code=400, detail="Items cannot be added to a received or cancelled order")
 
     medicine = conn.execute(
-        "SELECT id, name, strength, dosage_form FROM medicines WHERE id = %s", (item.medicine_id,)
+        "SELECT id, name, strength, dosage_form, is_active FROM medicines WHERE id = %s", (item.medicine_id,)
     ).fetchone()
     if medicine is None:
         raise HTTPException(status_code=404, detail="Medicine not found")
+    if not medicine["is_active"]:
+        raise HTTPException(status_code=400, detail="This medicine is inactive (discontinued) and cannot be ordered")
 
     if conn.execute(
         "SELECT 1 FROM purchase_order_items WHERE purchase_order_id = %s AND medicine_id = %s",
@@ -406,7 +409,7 @@ def receive_purchase_order_item(receipt: PurchaseReceiptCreate,
         """
         SELECT poi.id, poi.purchase_order_id, poi.medicine_id, poi.quantity_ordered,
                poi.quantity_received, poi.unit_cost, po.status, po.order_number, po.supplier_id,
-               medicines.name AS medicine
+               po.order_date, medicines.name AS medicine
         FROM purchase_order_items poi
         JOIN purchase_orders po ON poi.purchase_order_id = po.id
         JOIN medicines ON medicines.id = poi.medicine_id
@@ -480,12 +483,13 @@ def receive_purchase_order_item(receipt: PurchaseReceiptCreate,
         batch_id = conn.execute(
             """
             INSERT INTO batches (medicine_id, batch_number, quantity, expiry_date, location_id,
-                                 unit_cost, supplier_id, received_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_DATE)
+                                 unit_cost, supplier_id, received_date, purchase_date, barcode_data)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_DATE, %s, %s)
             RETURNING id
             """,
             (item["medicine_id"], receipt.batch_number, receipt.quantity_received, receipt.expiry_date,
-             location_id, unit_cost, item["supplier_id"]),
+             location_id, unit_cost, item["supplier_id"], item["order_date"],
+             blank_to_none(receipt.barcode_data)),
         ).fetchone()["id"]
         new_batch_quantity = receipt.quantity_received
 

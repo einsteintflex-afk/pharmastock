@@ -8,11 +8,12 @@ from datetime import date
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from .. import audit
 from ..database import get_db
+from ..pagination import Page, page_params, paginate
 from ..schemas import Code100, LongText, blank_to_none
 from ..security import CurrentUser, require
 from ..services import expiry, inventory, stock
@@ -20,6 +21,7 @@ from ..services import expiry, inventory, stock
 router = APIRouter(tags=["Inventory"])
 
 ExpiryStatus = Literal["EXPIRED", "CRITICAL", "URGENT", "APPROACHING EXPIRY", "NORMAL"]
+BatchStatus = Literal["ACTIVE", "QUARANTINED", "RECALLED"]
 
 
 class BatchCreate(BaseModel):
@@ -31,6 +33,8 @@ class BatchCreate(BaseModel):
     location_id: int | None = None
     supplier_id: int | None = None
     received_date: date | None = None
+    purchase_date: date | None = None
+    barcode_data: str | None = Field(default=None, max_length=200)
 
 
 class BatchUpdate(BaseModel):
@@ -39,6 +43,16 @@ class BatchUpdate(BaseModel):
     unit_cost: float | None = Field(default=None, ge=0, le=10_000_000)
     supplier_id: int | None = None
     received_date: date | None = None
+    reason: LongText = Field(min_length=3)
+
+
+class BatchStatusChange(BaseModel):
+    batch_status: BatchStatus
+    reason: LongText = Field(min_length=3)
+
+
+class ReconcileRequest(BaseModel):
+    action: Literal["TRUST_LEDGER", "TRUST_COUNT"]
     reason: LongText = Field(min_length=3)
 
 
@@ -77,12 +91,15 @@ def check_supplier(conn, supplier_id: int) -> None:
 
 @router.get("/inventory")
 def get_inventory(
+    response: Response,
     search: str | None = Query(default=None, max_length=100),
     status: ExpiryStatus | None = None,
     medicine_id: int | None = None,
     location_id: int | None = None,
     supplier_id: int | None = None,
     include_empty: bool = True,
+    batch_status: BatchStatus | None = None,
+    page: Page = Depends(page_params),
     user: CurrentUser = Depends(require("inventory.read")),
     conn: psycopg.Connection = Depends(get_db),
 ):
@@ -90,8 +107,10 @@ def get_inventory(
         conn, search=search, status=status, medicine_id=medicine_id, location_id=location_id,
         supplier_id=supplier_id, include_empty=include_empty,
     )
+    if batch_status:
+        rows = [r for r in rows if r["batch_status"] == batch_status]
     # Original fields first (expiry_date as a string, as before), then additions.
-    return [{**row, "expiry_date": str(row["expiry_date"])} for row in rows]
+    return paginate([{**row, "expiry_date": str(row["expiry_date"])} for row in rows], page, response)
 
 
 @router.get("/expiry-alerts")
@@ -120,8 +139,11 @@ def create_batch(batch: BatchCreate, user: CurrentUser = Depends(require("batche
     """Register a batch directly (opening stock, donation, stock outside a
     purchase order). The initial quantity is recorded as a RECEIVED movement
     so the stock ledger stays reconciled."""
-    if conn.execute("SELECT 1 FROM medicines WHERE id = %s", (batch.medicine_id,)).fetchone() is None:
+    medicine = conn.execute("SELECT is_active FROM medicines WHERE id = %s", (batch.medicine_id,)).fetchone()
+    if medicine is None:
         raise HTTPException(status_code=404, detail="Medicine not found")
+    if not medicine["is_active"]:
+        raise HTTPException(status_code=400, detail="This medicine is inactive (discontinued); reactivate it first")
 
     location_id = batch.location_id or default_location_id(conn)
     check_location(conn, location_id)
@@ -142,13 +164,14 @@ def create_batch(batch: BatchCreate, user: CurrentUser = Depends(require("batche
     row = conn.execute(
         """
         INSERT INTO batches (medicine_id, batch_number, quantity, expiry_date, location_id,
-                             unit_cost, supplier_id, received_date)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                             unit_cost, supplier_id, received_date, purchase_date, barcode_data)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id, medicine_id, batch_number, quantity, expiry_date, location_id, unit_cost,
-                  supplier_id, received_date
+                  supplier_id, received_date, purchase_date, batch_status
         """,
         (batch.medicine_id, batch.batch_number, batch.quantity, batch.expiry_date, location_id,
-         batch.unit_cost, batch.supplier_id, batch.received_date or date.today()),
+         batch.unit_cost, batch.supplier_id, batch.received_date or date.today(), batch.purchase_date,
+         blank_to_none(batch.barcode_data)),
     ).fetchone()
 
     if batch.quantity > 0:
@@ -205,6 +228,16 @@ def batch_detail(batch_id: int, user: CurrentUser = Depends(require("inventory.r
         "reconciled": balance == rows[0]["quantity"],
         "receipts": receipts,
     }
+
+
+@router.post("/batches/{batch_id}/status")
+def change_batch_status(batch_id: int, body: BatchStatusChange,
+                        user: CurrentUser = Depends(require("stock.adjust")),
+                        conn: psycopg.Connection = Depends(get_db)):
+    """Quarantine, recall or release a batch."""
+    row = stock.set_batch_status(conn, user, batch_id, body.batch_status, body.reason)
+    conn.commit()
+    return row
 
 
 @router.put("/batches/{batch_id}")
@@ -322,3 +355,13 @@ def stock_reconciliation(user: CurrentUser = Depends(require("inventory.read")),
     means the ledger is fully reconciled."""
     mismatches = stock.reconciliation(conn)
     return {"reconciled": not mismatches, "mismatches": mismatches}
+
+
+@router.post("/stock-reconciliation/{batch_id}/resolve")
+def resolve_reconciliation(batch_id: int, body: ReconcileRequest,
+                           user: CurrentUser = Depends(require("stock.adjust")),
+                           conn: psycopg.Connection = Depends(get_db)):
+    """Resolve one mismatched batch (audited; see stock.resolve_mismatch)."""
+    result = stock.resolve_mismatch(conn, user, batch_id, body.action, body.reason)
+    conn.commit()
+    return result

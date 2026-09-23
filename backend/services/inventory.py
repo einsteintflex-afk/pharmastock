@@ -3,9 +3,10 @@
 # ============================================================
 # Read-only queries over medicines, batches and movements. Stock figures:
 #
-#   usable_stock   units in batches that have not expired (dispensable)
+#   usable_stock   units in ACTIVE batches that have not expired (dispensable)
+#   held_stock     units in non-expired QUARANTINED / RECALLED batches
 #   expired_stock  units in expired batches still on the shelf
-#   total_stock    usable + expired (physically present)
+#   total_stock    usable + held + expired (physically present)
 #
 # Stock status uses usable stock, because expired units cannot be dispensed:
 #   OUT OF STOCK  usable_stock = 0
@@ -92,6 +93,10 @@ def batches(
                 suppliers.name AS supplier,
                 batches.unit_cost,
                 batches.received_date,
+                batches.purchase_date,
+                batches.batch_status,
+                batches.status_reason,
+                batches.barcode_data,
                 batches.created_at,
                 CASE WHEN batches.unit_cost IS NULL THEN NULL
                      ELSE ROUND(batches.quantity * batches.unit_cost, 2) END AS stock_value
@@ -133,14 +138,24 @@ def medicine_stock(
                 medicines.dosage_form,
                 medicines.reorder_level,
                 medicines.selling_price,
-                COALESCE(SUM(batches.quantity) FILTER (WHERE batches.expiry_date >= CURRENT_DATE), 0)::int
+                medicines.generic_name,
+                medicines.brand_name,
+                medicines.route,
+                medicines.gtin,
+                medicines.is_active,
+                COALESCE(SUM(batches.quantity) FILTER (
+                    WHERE batches.expiry_date >= CURRENT_DATE AND batches.batch_status = 'ACTIVE'), 0)::int
                     AS usable_stock,
+                COALESCE(SUM(batches.quantity) FILTER (
+                    WHERE batches.expiry_date >= CURRENT_DATE AND batches.batch_status <> 'ACTIVE'), 0)::int
+                    AS held_stock,
                 COALESCE(SUM(batches.quantity) FILTER (WHERE batches.expiry_date < CURRENT_DATE), 0)::int
                     AS expired_stock,
                 COALESCE(SUM(batches.quantity), 0)::int AS total_stock,
                 COUNT(batches.id) FILTER (WHERE batches.quantity > 0) AS batches_in_stock,
                 MIN(batches.expiry_date) FILTER (
                     WHERE batches.quantity > 0 AND batches.expiry_date >= CURRENT_DATE
+                      AND batches.batch_status = 'ACTIVE'
                 ) AS next_expiry,
                 ROUND(COALESCE(SUM(batches.quantity * batches.unit_cost), 0), 2) AS stock_value,
                 COALESCE(SUM(batches.quantity) FILTER (

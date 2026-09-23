@@ -8,14 +8,15 @@
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, Field, field_validator
 
 from .. import audit
 from ..database import get_db
+from ..pagination import Page, page_params, paginate
 from ..schemas import Name150, Short50, blank_to_none
 from ..security import CurrentUser, require
-from ..services import analytics, inventory, stock
+from ..services import analytics, barcode, inventory, stock
 
 router = APIRouter(tags=["Medicines"])
 
@@ -27,6 +28,19 @@ class Medicine(BaseModel):
     dosage_form: str | None
     reorder_level: int
     selling_price: float | None = None
+    generic_name: str | None = None
+    brand_name: str | None = None
+    route: str | None = None
+    manufacturer: str | None = None
+    gtin: str | None = None
+    is_active: bool = True
+
+
+# Master-data fields added after the original API. On update, a field that
+# is omitted keeps its current value, so older clients cannot wipe them.
+OPTIONAL_FIELDS = ("selling_price", "generic_name", "brand_name", "route", "manufacturer", "gtin", "is_active")
+COLUMNS = ("id, name, strength, dosage_form, reorder_level, selling_price, generic_name, brand_name, route, "
+           "manufacturer, gtin, is_active")
 
 
 class MedicineCreate(BaseModel):
@@ -34,12 +48,44 @@ class MedicineCreate(BaseModel):
     strength: Short50 | None = None
     dosage_form: Short50 | None = None
     reorder_level: int = Field(default=20, ge=0, le=10_000_000)
-    # Optional. On update, omitting it keeps the current price.
     selling_price: float | None = Field(default=None, ge=0, le=1_000_000)
+    generic_name: Name150 | None = None
+    brand_name: Name150 | None = None
+    route: Short50 | None = None
+    manufacturer: Name150 | None = None
+    gtin: str | None = Field(default=None, max_length=20)
+    is_active: bool = True
+
+    @field_validator("gtin")
+    @classmethod
+    def _gtin(cls, value):
+        try:
+            return barcode.normalize_gtin(value)
+        except barcode.BarcodeError as error:
+            raise ValueError(str(error)) from error
 
 
 def _clean(body: MedicineCreate) -> tuple:
     return (body.name, blank_to_none(body.strength), blank_to_none(body.dosage_form), body.reorder_level)
+
+
+def _optional_values(body: MedicineCreate, old: dict | None) -> tuple:
+    values = []
+    for field in OPTIONAL_FIELDS:
+        if old is not None and field not in body.model_fields_set:
+            values.append(old[field])
+        else:
+            value = getattr(body, field)
+            values.append(blank_to_none(value) if isinstance(value, str) else value)
+    return tuple(values)
+
+
+def _gtin_check(conn, gtin: str | None, exclude_id: int | None = None) -> None:
+    if gtin and conn.execute(
+        "SELECT 1 FROM medicines WHERE gtin = %s AND (%s::int IS NULL OR id <> %s::int)",
+        (gtin, exclude_id, exclude_id),
+    ).fetchone():
+        raise HTTPException(status_code=409, detail="Another medicine already has this GTIN / barcode")
 
 
 def _duplicate_check(conn, body: MedicineCreate, exclude_id: int | None = None) -> None:
@@ -63,35 +109,43 @@ def _duplicate_check(conn, body: MedicineCreate, exclude_id: int | None = None) 
 
 @router.get("/medicines", response_model=list[Medicine])
 def get_medicines(
+    response: Response,
     search: str | None = Query(default=None, max_length=100),
     sort: Literal["id", "name", "reorder_level"] = "id",
+    active: bool | None = None,
+    page: Page = Depends(page_params),
     user: CurrentUser = Depends(require("inventory.read")),
     conn: psycopg.Connection = Depends(get_db),
 ):
     order = {"id": "id", "name": "lower(name), id", "reorder_level": "reorder_level, lower(name)"}[sort]
-    return conn.execute(
+    rows = conn.execute(
         f"""
-        SELECT id, name, strength, dosage_form, reorder_level, selling_price
+        SELECT {COLUMNS}
         FROM medicines
         WHERE (%(search)s::text IS NULL
-               OR name ILIKE %(pattern)s OR strength ILIKE %(pattern)s OR dosage_form ILIKE %(pattern)s)
+               OR name ILIKE %(pattern)s OR strength ILIKE %(pattern)s OR dosage_form ILIKE %(pattern)s
+               OR generic_name ILIKE %(pattern)s OR brand_name ILIKE %(pattern)s
+               OR gtin = lpad(%(search)s::text, 14, '0'))
+          AND (%(active)s::boolean IS NULL OR is_active = %(active)s::boolean)
         ORDER BY {order}
         """,
-        {"search": search, "pattern": f"%{(search or '').strip()}%"},
+        {"search": search, "pattern": f"%{(search or '').strip()}%", "active": active},
     ).fetchall()
+    return paginate(rows, page, response)
 
 
 @router.post("/medicines", response_model=Medicine)
 def create_medicine(body: MedicineCreate, user: CurrentUser = Depends(require("medicines.write")),
                     conn: psycopg.Connection = Depends(get_db)):
     _duplicate_check(conn, body)
+    _gtin_check(conn, body.gtin)
     row = conn.execute(
-        """
-        INSERT INTO medicines (name, strength, dosage_form, reorder_level, selling_price)
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING id, name, strength, dosage_form, reorder_level, selling_price
+        f"""
+        INSERT INTO medicines (name, strength, dosage_form, reorder_level, {', '.join(OPTIONAL_FIELDS)})
+        VALUES (%s, %s, %s, %s, {', '.join(['%s'] * len(OPTIONAL_FIELDS))})
+        RETURNING {COLUMNS}
         """,
-        (*_clean(body), body.selling_price),
+        (*_clean(body), *_optional_values(body, None)),
     ).fetchone()
     audit.record(conn, user, "CREATE", "medicine", row["id"], None, dict(row))
     conn.commit()
@@ -102,23 +156,22 @@ def create_medicine(body: MedicineCreate, user: CurrentUser = Depends(require("m
 def update_medicine(medicine_id: int, body: MedicineCreate,
                     user: CurrentUser = Depends(require("medicines.write")),
                     conn: psycopg.Connection = Depends(get_db)):
-    old = conn.execute(
-        "SELECT id, name, strength, dosage_form, reorder_level, selling_price FROM medicines WHERE id = %s FOR UPDATE",
-        (medicine_id,),
-    ).fetchone()
+    old = conn.execute(f"SELECT {COLUMNS} FROM medicines WHERE id = %s FOR UPDATE", (medicine_id,)).fetchone()
     if old is None:
         raise HTTPException(status_code=404, detail="Medicine not found")
 
     _duplicate_check(conn, body, exclude_id=medicine_id)
+    optional = _optional_values(body, old)
+    _gtin_check(conn, optional[OPTIONAL_FIELDS.index("gtin")], exclude_id=medicine_id)
 
-    price = body.selling_price if "selling_price" in body.model_fields_set else old["selling_price"]
     row = conn.execute(
-        """
-        UPDATE medicines SET name = %s, strength = %s, dosage_form = %s, reorder_level = %s, selling_price = %s
+        f"""
+        UPDATE medicines SET name = %s, strength = %s, dosage_form = %s, reorder_level = %s,
+               {', '.join(f + ' = %s' for f in OPTIONAL_FIELDS)}
         WHERE id = %s
-        RETURNING id, name, strength, dosage_form, reorder_level, selling_price
+        RETURNING {COLUMNS}
         """,
-        (*_clean(body), price, medicine_id),
+        (*_clean(body), *optional, medicine_id),
     ).fetchone()
     before, after = audit.changed_fields(dict(old), dict(row))
     if after:

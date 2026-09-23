@@ -3,11 +3,12 @@
 # ============================================================
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from .. import audit
 from ..database import get_db
+from ..pagination import Page, page_params, paginate
 from ..schemas import Email, LongText, Name150, Phone, blank_to_none
 from ..security import CurrentUser, require
 
@@ -76,11 +77,13 @@ def create_supplier(supplier: SupplierCreate, user: CurrentUser = Depends(requir
 
 
 @router.get("/suppliers", response_model=list[Supplier])
-def get_suppliers(search: str | None = Query(default=None, max_length=100),
+def get_suppliers(response: Response,
+                  search: str | None = Query(default=None, max_length=100),
                   active: bool | None = None,
+                  page: Page = Depends(page_params),
                   user: CurrentUser = Depends(require("inventory.read")),
                   conn: psycopg.Connection = Depends(get_db)):
-    return conn.execute(
+    rows = conn.execute(
         f"""
         SELECT {SUPPLIER_COLUMNS} FROM suppliers
         WHERE (%(search)s::text IS NULL OR name ILIKE %(pattern)s OR contact_person ILIKE %(pattern)s
@@ -90,6 +93,7 @@ def get_suppliers(search: str | None = Query(default=None, max_length=100),
         """,
         {"search": search, "pattern": f"%{(search or '').strip()}%", "active": active},
     ).fetchall()
+    return paginate(rows, page, response)
 
 
 @router.get("/suppliers/{supplier_id}")
@@ -131,6 +135,41 @@ def supplier_detail(supplier_id: int, user: CurrentUser = Depends(require("inven
         (supplier_id,),
     ).fetchall()
 
+    receipts = conn.execute(
+        """
+        SELECT pr.id AS receipt_id, pr.received_date, pr.quantity_received, pr.received_by,
+               po.id AS purchase_order_id, po.order_number, medicines.id AS medicine_id,
+               medicines.name AS medicine, medicines.strength, batches.id AS batch_id,
+               batches.batch_number, batches.expiry_date, poi.unit_cost,
+               ROUND(pr.quantity_received * poi.unit_cost, 2) AS value
+        FROM purchase_receipts pr
+        JOIN purchase_order_items poi ON poi.id = pr.purchase_order_item_id
+        JOIN purchase_orders po ON po.id = poi.purchase_order_id
+        JOIN medicines ON medicines.id = poi.medicine_id
+        JOIN batches ON batches.id = pr.batch_id
+        WHERE po.supplier_id = %s
+        ORDER BY pr.received_date DESC, pr.id DESC
+        LIMIT 200
+        """,
+        (supplier_id,),
+    ).fetchall()
+
+    # Activity: changes to the supplier record and to its purchase orders.
+    activity = conn.execute(
+        """
+        SELECT audit_log.occurred_at, audit_log.username, audit_log.action, audit_log.entity_type,
+               audit_log.entity_id, po.order_number
+        FROM audit_log
+        LEFT JOIN purchase_orders po
+            ON audit_log.entity_type = 'purchase_order' AND audit_log.entity_id = po.id::text
+        WHERE (audit_log.entity_type = 'supplier' AND audit_log.entity_id = %(id)s::text)
+           OR po.supplier_id = %(id)s
+        ORDER BY audit_log.occurred_at DESC, audit_log.id DESC
+        LIMIT 50
+        """,
+        {"id": supplier_id},
+    ).fetchall()
+
     active_orders = sum(1 for o in orders if o["status"] in ("DRAFT", "ORDERED", "PARTIALLY_RECEIVED"))
     return {
         "supplier": supplier,
@@ -139,7 +178,12 @@ def supplier_detail(supplier_id: int, user: CurrentUser = Depends(require("inven
             "open_orders": active_orders,
             "total_ordered_value": round(sum(float(o["order_value"]) for o in orders if o["status"] != "CANCELLED"), 2),
             "total_received_value": round(sum(float(o["received_value"]) for o in orders), 2),
+            "receipts": len(receipts),
+            "units_received": sum(r["quantity_received"] for r in receipts),
+            "last_receipt_date": receipts[0]["received_date"] if receipts else None,
         },
+        "receipts": receipts,
+        "activity": activity,
         "purchase_history": orders,
         "products_supplied": products,
     }

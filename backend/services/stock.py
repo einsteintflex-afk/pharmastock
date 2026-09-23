@@ -11,7 +11,7 @@
 # (reconciliation() verifies this).
 #
 # FEFO — First Expiry, First Out: dispensing is allocated to the usable
-# (non-expired) batches of a medicine in order of expiry date, earliest
+# (ACTIVE, non-expired) batches of a medicine in order of expiry date, earliest
 # first, splitting across batches when one is not enough.
 
 from datetime import date
@@ -50,7 +50,8 @@ def _lock_batch(conn: psycopg.Connection, batch_id: int) -> dict:
     batch = conn.execute(
         """
         SELECT batches.id, batches.medicine_id, batches.batch_number, batches.quantity,
-               batches.expiry_date, batches.location_id, medicines.name AS medicine
+               batches.expiry_date, batches.location_id, batches.batch_status,
+               medicines.name AS medicine
         FROM batches
         JOIN medicines ON medicines.id = batches.medicine_id
         WHERE batches.id = %s
@@ -100,6 +101,7 @@ def fefo_batches(
         WHERE batches.medicine_id = %(medicine_id)s
           AND batches.quantity > 0
           AND batches.expiry_date >= CURRENT_DATE
+          AND batches.batch_status = 'ACTIVE'
           AND (%(location_id)s::int IS NULL OR batches.location_id = %(location_id)s::int)
         ORDER BY batches.expiry_date, batches.id
         {'FOR UPDATE OF batches' if lock else ''}
@@ -263,6 +265,11 @@ def record_movement(
     expired = batch["expiry_date"] < date.today()
 
     if movement_type == "DISPENSED":
+        if batch["batch_status"] != "ACTIVE":
+            raise HTTPException(
+                status_code=400,
+                detail=f"This batch is {batch['batch_status'].lower()} and cannot be dispensed.",
+            )
         if expired:
             raise HTTPException(
                 status_code=400,
@@ -345,3 +352,71 @@ def reconciliation(conn: psycopg.Connection) -> list[dict]:
         ORDER BY batches.id
         """
     ).fetchall()
+
+
+BATCH_STATUSES = ("ACTIVE", "QUARANTINED", "RECALLED")
+
+
+def set_batch_status(conn: psycopg.Connection, user: CurrentUser, batch_id: int, status: str,
+                     reason: str) -> dict:
+    """Place a batch on hold (QUARANTINED / RECALLED) or release it. Held
+    stock stays on the books but is excluded from FEFO and dispensing."""
+    if status not in BATCH_STATUSES:
+        raise HTTPException(status_code=400, detail={"message": "Invalid batch status",
+                                                     "allowed": list(BATCH_STATUSES)})
+    batch = _lock_batch(conn, batch_id)
+    if batch["batch_status"] == status:
+        raise HTTPException(status_code=400, detail=f"The batch is already {status.lower()}")
+    if batch["batch_status"] == "RECALLED" and status == "ACTIVE" and not user.can("settings.manage"):
+        raise HTTPException(status_code=403, detail="Only a manager or administrator can release a recalled batch")
+    row = conn.execute(
+        """
+        UPDATE batches SET batch_status = %s, status_reason = %s, status_changed_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        RETURNING id AS batch_id, batch_number, batch_status, status_reason, status_changed_at, quantity
+        """,
+        (status, reason, batch_id),
+    ).fetchone()
+    audit.record(conn, user, f"BATCH_{status}", "batch", batch_id,
+                 {"batch_status": batch["batch_status"]}, {"batch_status": status, "reason": reason})
+    return row
+
+
+def resolve_mismatch(conn: psycopg.Connection, user: CurrentUser, batch_id: int, action: str,
+                     reason: str) -> dict:
+    """Resolve a batch whose recorded quantity differs from its ledger.
+
+    TRUST_LEDGER  set the batch quantity to the sum of its movements (the
+                  recorded quantity was changed outside the ledger).
+    TRUST_COUNT   keep the recorded quantity (confirmed by a physical count)
+                  and write one ADJUSTMENT movement for the difference, so
+                  the ledger explains the stock.
+    """
+    batch = _lock_batch(conn, batch_id)
+    ledger = conn.execute(
+        f"SELECT {LEDGER_SUM_SQL}::int AS ledger FROM stock_movements sm WHERE sm.batch_id = %s", (batch_id,)
+    ).fetchone()["ledger"]
+    difference = batch["quantity"] - ledger
+    if difference == 0:
+        raise HTTPException(status_code=400, detail="This batch is already reconciled")
+
+    movement = None
+    if action == "TRUST_LEDGER":
+        if ledger < 0:
+            raise HTTPException(status_code=400, detail="The ledger total is negative; record a count instead")
+        conn.execute("UPDATE batches SET quantity = %s WHERE id = %s", (ledger, batch_id))
+        new_quantity = ledger
+    elif action == "TRUST_COUNT":
+        movement = insert_movement(conn, batch_id, "ADJUSTMENT", difference,
+                                   f"Reconciliation: {reason}", user)
+        new_quantity = batch["quantity"]
+    else:
+        raise HTTPException(status_code=400, detail="action must be TRUST_LEDGER or TRUST_COUNT")
+
+    audit.record(conn, user, "RECONCILE", "batch", batch_id,
+                 {"recorded_quantity": batch["quantity"], "ledger_quantity": ledger},
+                 {"action": action, "quantity": new_quantity, "reason": reason,
+                  "movement_id": movement["id"] if movement else None})
+    return {"batch_id": batch_id, "action": action, "previous_recorded_quantity": batch["quantity"],
+            "ledger_quantity_before": ledger, "quantity": new_quantity,
+            "adjustment_movement_id": movement["id"] if movement else None}

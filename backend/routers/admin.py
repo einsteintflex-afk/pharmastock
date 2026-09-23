@@ -7,12 +7,13 @@ from datetime import date, timedelta
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from .. import audit
 from ..database import get_db
 from ..migrate import status as migration_status
+from ..pagination import set_total
 from ..schemas import Name150
 from ..security import CurrentUser, require
 from ..services import app_settings, notifications, plans
@@ -84,18 +85,20 @@ def refresh_notifications(user: CurrentUser = Depends(require("notifications.rea
 # ------------------------------------------------------------
 
 @router.get("/audit-log", tags=["Audit"])
-def audit_log(entity_type: str | None = Query(default=None, max_length=50),
+def audit_log(response: Response,
+              entity_type: str | None = Query(default=None, max_length=50),
               entity_id: str | None = Query(default=None, max_length=64),
               user_id: int | None = None,
               action: str | None = Query(default=None, max_length=50),
               date_from: date | None = None, date_to: date | None = None,
               limit: int = Query(default=200, gt=0, le=5000),
+              offset: int = Query(default=0, ge=0),
               user: CurrentUser = Depends(require("audit.read")),
               conn: psycopg.Connection = Depends(get_db)):
-    return conn.execute(
+    rows = conn.execute(
         """
         SELECT id, occurred_at, user_id, username, action, entity_type, entity_id,
-               old_value, new_value, ip_address
+               old_value, new_value, ip_address, COUNT(*) OVER () AS total_count
         FROM audit_log
         WHERE (%(entity_type)s::text IS NULL OR entity_type = %(entity_type)s::text)
           AND (%(entity_id)s::text IS NULL OR entity_id = %(entity_id)s::text)
@@ -104,12 +107,14 @@ def audit_log(entity_type: str | None = Query(default=None, max_length=50),
           AND (%(date_from)s::date IS NULL OR occurred_at >= %(date_from)s::date)
           AND (%(date_to)s::date IS NULL OR occurred_at < %(date_to_next)s::date)
         ORDER BY occurred_at DESC, id DESC
-        LIMIT %(limit)s
+        LIMIT %(limit)s OFFSET %(offset)s
         """,
         {"entity_type": entity_type, "entity_id": entity_id, "user_id": user_id, "action": action,
          "date_from": date_from, "date_to": date_to,
-         "date_to_next": (date_to + timedelta(days=1)) if date_to else None, "limit": limit},
+         "date_to_next": (date_to + timedelta(days=1)) if date_to else None, "limit": limit,
+         "offset": offset},
     ).fetchall()
+    return set_total(response, rows)
 
 
 # ------------------------------------------------------------

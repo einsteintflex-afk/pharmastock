@@ -10,17 +10,19 @@ from datetime import date, timedelta
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, Field
 
 from ..database import get_db
+from ..pagination import set_total
 from ..schemas import LongText
 from ..security import CurrentUser, get_current_user, require
 from ..services import stock
 
 router = APIRouter(tags=["Stock movements"])
 
-MovementType = Literal["RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT"]
+MovementType = Literal["RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT",
+                       "TRANSFER_OUT", "TRANSFER_IN"]
 
 
 class StockMovementCreate(BaseModel):
@@ -46,6 +48,7 @@ def create_stock_movement(movement: StockMovementCreate,
 
 @router.get("/stock-movements")
 def get_stock_movements(
+    response: Response,
     movement_type: MovementType | None = None,
     medicine_id: int | None = None,
     batch_id: int | None = None,
@@ -53,6 +56,7 @@ def get_stock_movements(
     date_from: date | None = None,
     date_to: date | None = None,
     limit: int | None = Query(default=None, gt=0, le=10_000),
+    offset: int = Query(default=0, ge=0),
     user: CurrentUser = Depends(require("inventory.read")),
     conn: psycopg.Connection = Depends(get_db),
 ):
@@ -71,7 +75,8 @@ def get_stock_movements(
             stock_movements.reason,
             medicines.id AS medicine_id,
             locations.name AS location,
-            users.full_name AS user_name
+            users.full_name AS user_name,
+            COUNT(*) OVER () AS total_count
         FROM stock_movements
         JOIN batches ON stock_movements.batch_id = batches.id
         JOIN medicines ON batches.medicine_id = medicines.id
@@ -84,14 +89,16 @@ def get_stock_movements(
           AND (%(date_from)s::date IS NULL OR stock_movements.movement_date >= %(date_from)s::date)
           AND (%(date_to)s::date IS NULL OR stock_movements.movement_date < %(date_to_next)s::date)
         ORDER BY stock_movements.movement_date DESC, stock_movements.id DESC
-        LIMIT %(limit)s
+        LIMIT %(limit)s OFFSET %(offset)s
         """,
         {
             "type": movement_type, "medicine_id": medicine_id, "batch_id": batch_id,
             "location_id": location_id, "date_from": date_from, "date_to": date_to,
             "date_to_next": (date_to + timedelta(days=1)) if date_to else None, "limit": limit,
+            "offset": offset,
         },
     ).fetchall()
+    set_total(response, rows)
     # movement_date as a string, as in the original API.
     return [{**row, "movement_date": str(row["movement_date"])} for row in rows]
 
