@@ -27,7 +27,7 @@ def _upsert(conn, *, key, category, severity, title, message, entity_type, entit
         """
         INSERT INTO notifications (category, severity, title, message, entity_type, entity_id, dedupe_key)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (dedupe_key) DO UPDATE SET
+        ON CONFLICT (organization_id, dedupe_key) DO UPDATE SET
             severity = EXCLUDED.severity,
             title = EXCLUDED.title,
             message = EXCLUDED.message,
@@ -130,7 +130,7 @@ def event(
         INSERT INTO notifications
             (category, severity, title, message, entity_type, entity_id, dedupe_key, resolved_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT (dedupe_key) DO NOTHING
+        ON CONFLICT (organization_id, dedupe_key) DO NOTHING
         """,
         (category, severity, title, message, entity_type, str(entity_id), key),
     )

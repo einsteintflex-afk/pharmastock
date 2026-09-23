@@ -7,7 +7,7 @@ import psycopg
 from fastapi import APIRouter, Depends, Query
 
 from ..database import get_db
-from ..security import CurrentUser, require
+from ..security import CurrentUser, require, require_feature
 from ..services import analytics
 
 router = APIRouter(tags=["Analytics"])
@@ -108,18 +108,18 @@ def valuation(user: CurrentUser = Depends(require("analytics.read")),
 
 @router.get("/analytics/forecast")
 def forecast(horizon_days: int = Query(default=30, ge=7, le=180),
-             user: CurrentUser = Depends(require("analytics.read")),
+             user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
              conn: psycopg.Connection = Depends(get_db)):
     return analytics.forecast(conn, horizon_days)
 
 
 @router.get("/analytics/turnover")
-def turnover(user: CurrentUser = Depends(require("analytics.read")),
+def turnover(user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
              conn: psycopg.Connection = Depends(get_db)):
     return analytics.turnover(conn)
 
 
 @router.get("/analytics/purchasing")
-def purchasing(user: CurrentUser = Depends(require("analytics.read")),
+def purchasing(user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
                conn: psycopg.Connection = Depends(get_db)):
     return analytics.purchasing_patterns(conn)

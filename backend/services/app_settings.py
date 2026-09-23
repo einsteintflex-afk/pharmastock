@@ -22,6 +22,34 @@ SETTING_RULES = {
 }
 
 
+# Defaults for a new organization (the original installation received the
+# same values through migrations 0006 and 0007).
+DEFAULTS = {
+    "expiry.critical_days": (30, "Batches expiring within this many days are CRITICAL"),
+    "expiry.urgent_days": (90, "Batches expiring within this many days are URGENT"),
+    "expiry.approaching_days": (180, "Batches expiring within this many days are APPROACHING EXPIRY"),
+    "stock.slow_moving_units_90d": (10, "Medicines dispensing this many units or fewer in 90 days are SLOW-MOVING"),
+    "reorder.lead_time_days": (14, "Typical supplier lead time used for reorder recommendations"),
+    "reorder.cover_days": (30, "Days of stock a reorder should cover after it arrives"),
+    "currency.symbol": ("₵", "Currency symbol shown in the interface and reports"),
+    "pharmacy.name": ("PharmaStock Pharmacy", "Pharmacy name printed on receipts"),
+    "pharmacy.address": ("", "Address printed on receipts"),
+    "pharmacy.phone": ("", "Phone number printed on receipts"),
+}
+
+
+def seed_defaults(conn: psycopg.Connection, overrides: dict | None = None) -> None:
+    """Insert any missing settings for the current organization."""
+    import json
+
+    for key, (value, description) in DEFAULTS.items():
+        value = (overrides or {}).get(key, value)
+        conn.execute(
+            "INSERT INTO app_settings (key, value, description) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+            (key, json.dumps(value), description),
+        )
+
+
 @dataclass(frozen=True)
 class ExpiryThresholds:
     critical_days: int

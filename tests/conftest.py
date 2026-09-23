@@ -83,8 +83,10 @@ def template_database():
     with psycopg.connect(url) as conn:
         for role in ROLES:
             conn.execute(
-                "INSERT INTO users (username, full_name, role, password_hash) VALUES (%s, %s, %s, %s)",
-                (role.lower(), f"Test {role.title().replace('_', ' ')}", role, password_hash),
+                "INSERT INTO users (username, full_name, role, password_hash, organization_id, is_platform_admin) "
+                "VALUES (%s, %s, %s, %s, 1, %s)",
+                (role.lower(), f"Test {role.title().replace('_', ' ')}", role, password_hash,
+                 role == "ADMINISTRATOR"),
             )
         conn.commit()
     yield
@@ -136,10 +138,18 @@ def api(template_database):
         yield Api(client)
 
 
+def org_connection(organization_id: int = 1, **kwargs):
+    """Direct connection scoped to one organization (row level security)."""
+    conn = psycopg.connect(TEST_URL, **kwargs)
+    conn.execute("SELECT set_config('app.organization_id', %s, false)", (str(organization_id),))
+    conn.commit()
+    return conn
+
+
 @pytest.fixture
 def db(api):
-    """Direct database connection (for setting up history and verifying persistence)."""
+    """Direct database connection for organization 1 (setup and persistence checks)."""
     from psycopg.rows import dict_row
 
-    with psycopg.connect(TEST_URL, row_factory=dict_row) as conn:
+    with org_connection(1, row_factory=dict_row) as conn:
         yield conn

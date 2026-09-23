@@ -23,7 +23,8 @@ from . import database
 from .config import settings
 from .migrate import pending_migrations
 from .routers import (
-    admin, analytics, assistant, auth, dispensing, inventory, medicines, purchasing, reports, stock, suppliers, users,
+    admin, analytics, assistant, auth, dispensing, inventory, medicines, organizations, purchasing, reports, stock,
+    suppliers, users,
 )
 from .services import notifications
 
@@ -70,10 +71,14 @@ def _bootstrap_admin() -> None:
             validate_password_strength(password, username)
         except HTTPException as error:
             raise RuntimeError(f"BOOTSTRAP_ADMIN_PASSWORD rejected: {error.detail}") from error
+        # The first administrator belongs to the original organization and may
+        # manage further organizations.
+        database.set_organization(conn, 1)
         conn.execute(
             """
-            INSERT INTO users (username, full_name, role, password_hash, must_change_password)
-            VALUES (%s, 'Administrator', 'ADMINISTRATOR', %s, true)
+            INSERT INTO users (username, full_name, role, password_hash, must_change_password,
+                               organization_id, is_platform_admin)
+            VALUES (%s, 'Administrator', 'ADMINISTRATOR', %s, true, 1, true)
             """,
             (username, hash_password(password)),
         )
@@ -86,12 +91,31 @@ def _bootstrap_admin() -> None:
 
 
 def _refresh_notifications() -> None:
+    """Recompute expiry / stock notifications for every active organization."""
     try:
         with database.pool.connection() as conn:
-            result = notifications.refresh(conn)
-        logger.info("Notifications refreshed: %s", result)
+            organization_ids = database.active_organization_ids(conn)
+        for organization_id in organization_ids:
+            with database.organization_connection(organization_id) as conn:
+                result = notifications.refresh(conn)
+                conn.commit()
+            logger.info("Notifications refreshed org=%s: %s", organization_id, result)
     except Exception:
         logger.exception("Notification refresh failed")
+
+
+def _check_database_role() -> None:
+    """Row level security does not apply to superusers / BYPASSRLS roles."""
+    with database.connect() as conn:
+        bypass = database.role_bypasses_rls(conn)
+    if not bypass:
+        return
+    message = ("The database role in DATABASE_URL is a superuser or has BYPASSRLS, so PostgreSQL "
+               "row level security (organization isolation) is NOT enforced. Connect as the "
+               "application role created by deploy/create_app_role.sql.")
+    if settings.is_production:
+        raise RuntimeError(message)
+    logger.warning(message)
 
 
 async def _notification_loop() -> None:
@@ -103,6 +127,7 @@ async def _notification_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _check_migrations()
+    _check_database_role()
     _bootstrap_admin()
     database.open_pool()
     task = asyncio.create_task(_notification_loop())
@@ -246,7 +271,7 @@ def health():
         return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
 
 
-for module in (auth, users, medicines, inventory, stock, dispensing, suppliers, purchasing, analytics,
+for module in (auth, users, organizations, medicines, inventory, stock, dispensing, suppliers, purchasing, analytics,
                reports, admin, assistant):
     app.include_router(module.router)
 

@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from .. import audit
 from ..config import settings
 from ..database import get_db
-from ..security import CurrentUser, require
+from ..security import CurrentUser, require_feature
 from ..services import assistant
 
 router = APIRouter(tags=["Assistant"])
@@ -28,7 +28,7 @@ class Question(BaseModel):
 
 
 @router.get("/assistant/status")
-def assistant_status(user: CurrentUser = Depends(require("assistant.use"))):
+def assistant_status(user: CurrentUser = Depends(require_feature("ai_assistant", "assistant.use"))):
     return {
         "engine": "claude" if settings.anthropic_api_key else "built-in",
         "model": settings.anthropic_model if settings.anthropic_api_key else None,
@@ -37,7 +37,7 @@ def assistant_status(user: CurrentUser = Depends(require("assistant.use"))):
 
 
 @router.post("/assistant/ask")
-def ask(body: Question, user: CurrentUser = Depends(require("assistant.use")),
+def ask(body: Question, user: CurrentUser = Depends(require_feature("ai_assistant", "assistant.use")),
         conn: psycopg.Connection = Depends(get_db)):
     result = assistant.ask(conn, body.question.strip(), [h.model_dump() for h in body.history])
     audit.record(conn, user, "ASSISTANT_QUERY", "assistant", None, None,

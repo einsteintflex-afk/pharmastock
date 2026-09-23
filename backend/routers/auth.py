@@ -11,8 +11,9 @@ from pydantic import BaseModel, Field
 
 from .. import audit
 from ..config import settings
-from ..database import get_db
+from ..database import get_db, set_organization
 from ..permissions import ROLE_LABELS, permissions_for
+from ..services import plans
 from ..security import (
     SESSION_COOKIE, CurrentUser, client_ip, create_session, get_current_user, hash_password,
     revoke_all_sessions, revoke_session, validate_password_strength, verify_password,
@@ -41,6 +42,12 @@ def _user_payload(user: CurrentUser) -> dict:
         "role_label": ROLE_LABELS[user.role],
         "must_change_password": user.must_change_password,
         "permissions": sorted(user.permissions),
+        "organization": {
+            "id": user.organization_id, "name": user.organization_name, "type": user.org_type,
+            "plan": user.plan, "features": sorted(user.features),
+        },
+        "is_platform_admin": user.is_platform_admin,
+        "location_id": user.location_id,
     }
 
 
@@ -53,10 +60,13 @@ def login(body: LoginRequest, request: Request, conn: psycopg.Connection = Depen
 
     user = conn.execute(
         """
-        SELECT id, username, full_name, role, password_hash, is_active, must_change_password,
-               failed_login_count, locked_until
-        FROM users WHERE lower(username) = lower(%s)
-        FOR UPDATE
+        SELECT users.id, username, full_name, role, password_hash, is_active, must_change_password,
+               failed_login_count, locked_until, organization_id, is_platform_admin, location_id,
+               organizations.name AS organization_name, organizations.org_type, organizations.plan,
+               organizations.limits, organizations.status AS organization_status
+        FROM users JOIN organizations ON organizations.id = users.organization_id
+        WHERE lower(username) = lower(%s)
+        FOR UPDATE OF users
         """,
         (body.username.strip(),),
     ).fetchone()
@@ -70,6 +80,9 @@ def login(body: LoginRequest, request: Request, conn: psycopg.Connection = Depen
         conn.commit()
         return failure
 
+    # Audit entries for this sign-in belong to the user's organization.
+    set_organization(conn, user["organization_id"])
+
     if user["locked_until"] and user["locked_until"] > datetime.now():
         audit.record(conn, None, "LOGIN_BLOCKED", "user", user["id"], None,
                      {"reason": "account locked"}, username=user["username"], ip=ip)
@@ -78,6 +91,12 @@ def login(body: LoginRequest, request: Request, conn: psycopg.Connection = Depen
             status_code=423,
             content={"detail": "Account temporarily locked after repeated failed sign-ins. Try again later."},
         )
+
+    if password_ok and user["organization_status"] in ("SUSPENDED", "CANCELLED"):
+        audit.record(conn, None, "LOGIN_BLOCKED", "user", user["id"], None,
+                     {"reason": "organization not active"}, username=user["username"], ip=ip)
+        conn.commit()
+        return JSONResponse(status_code=403, content={"detail": "Your organization's PharmaStock account is not active."})
 
     if not password_ok or not user["is_active"]:
         attempts = user["failed_login_count"] + 1
@@ -111,6 +130,10 @@ def login(body: LoginRequest, request: Request, conn: psycopg.Connection = Depen
         id=user["id"], username=user["username"], full_name=user["full_name"], role=user["role"],
         must_change_password=user["must_change_password"], token=token, ip=ip,
         permissions=permissions_for(user["role"]),
+        organization_id=user["organization_id"], organization_name=user["organization_name"],
+        org_type=user["org_type"], plan=user["plan"], is_platform_admin=user["is_platform_admin"],
+        location_id=user["location_id"],
+        features=set(plans.effective({"plan": user["plan"], "limits": user["limits"]})["features"]),
     )
 
     response = JSONResponse(content={

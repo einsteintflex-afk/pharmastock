@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import psycopg
 import pytest
 
-from tests.conftest import TEST_URL
+from tests.conftest import org_connection
 
 
 def test_audit_records_old_and_new_values(api, db):
@@ -26,7 +26,7 @@ def test_audit_api_filters(api):
 
 
 def test_audit_log_is_append_only():
-    with psycopg.connect(TEST_URL) as conn:
+    with org_connection(1) as conn:
         with pytest.raises(psycopg.errors.RaiseException):
             conn.execute("UPDATE audit_log SET action = 'X'")
         conn.rollback()

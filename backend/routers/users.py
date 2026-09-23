@@ -14,6 +14,7 @@ from ..database import get_db
 from ..permissions import PERMISSIONS, ROLE_LABELS, ROLE_PERMISSIONS, ROLES
 from ..schemas import Email, Name150, blank_to_none
 from ..security import CurrentUser, hash_password, require, revoke_all_sessions, validate_password_strength
+from ..services import plans
 
 router = APIRouter(tags=["Users"])
 
@@ -21,7 +22,7 @@ RoleName = Literal["ADMINISTRATOR", "MANAGER", "PHARMACIST", "PHARMACY_TECHNICIA
 
 USER_COLUMNS = """
     id, username, full_name, email, role, is_active, must_change_password,
-    last_login_at, created_at, updated_at, locked_until
+    last_login_at, created_at, updated_at, locked_until, location_id, is_platform_admin
 """
 
 
@@ -31,6 +32,7 @@ class UserCreate(BaseModel):
     email: Email | None = None
     role: RoleName
     password: str = Field(min_length=1, max_length=200)
+    location_id: int | None = None
 
 
 class UserUpdate(BaseModel):
@@ -38,23 +40,39 @@ class UserUpdate(BaseModel):
     email: Email | None = None
     role: RoleName
     is_active: bool
+    location_id: int | None = None
 
 
 class PasswordReset(BaseModel):
     temporary_password: str | None = Field(default=None, max_length=200)
 
 
-def _get(conn, user_id: int) -> dict:
-    row = conn.execute(f"SELECT {USER_COLUMNS} FROM users WHERE id = %s", (user_id,)).fetchone()
+# The users table is not under row level security (sign-in must find a
+# user before the organization is known), so every query here filters on
+# the caller's organization explicitly.
+
+def _get(conn, user_id: int, organization_id: int) -> dict:
+    row = conn.execute(
+        f"SELECT {USER_COLUMNS} FROM users WHERE id = %s AND organization_id = %s", (user_id, organization_id)
+    ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="User not found")
     return row
 
 
-def _active_admins(conn) -> int:
+def _active_admins(conn, organization_id: int) -> int:
     return conn.execute(
-        "SELECT COUNT(*) AS n FROM users WHERE role = 'ADMINISTRATOR' AND is_active"
+        "SELECT COUNT(*) AS n FROM users WHERE role = 'ADMINISTRATOR' AND is_active AND organization_id = %s",
+        (organization_id,),
     ).fetchone()["n"]
+
+
+def _check_location(conn, location_id: int | None) -> None:
+    # locations is under row level security: only this organization's rows are visible.
+    if location_id is not None and conn.execute(
+        "SELECT 1 FROM locations WHERE id = %s", (location_id,)
+    ).fetchone() is None:
+        raise HTTPException(status_code=404, detail="Location not found")
 
 
 @router.get("/roles")
@@ -71,7 +89,10 @@ def list_roles(user: CurrentUser = Depends(require("inventory.read"))):
 @router.get("/users")
 def list_users(user: CurrentUser = Depends(require("users.manage")),
                conn: psycopg.Connection = Depends(get_db)):
-    rows = conn.execute(f"SELECT {USER_COLUMNS} FROM users ORDER BY lower(username)").fetchall()
+    rows = conn.execute(
+        f"SELECT {USER_COLUMNS} FROM users WHERE organization_id = %s ORDER BY lower(username)",
+        (user.organization_id,),
+    ).fetchall()
     return [{**row, "role_label": ROLE_LABELS[row["role"]]} for row in rows]
 
 
@@ -79,6 +100,11 @@ def list_users(user: CurrentUser = Depends(require("users.manage")),
 def create_user(body: UserCreate, user: CurrentUser = Depends(require("users.manage")),
                 conn: psycopg.Connection = Depends(get_db)):
     validate_password_strength(body.password, body.username)
+    _check_location(conn, body.location_id)
+    active = conn.execute(
+        "SELECT COUNT(*) AS n FROM users WHERE organization_id = %s AND is_active", (user.organization_id,)
+    ).fetchone()["n"]
+    plans.check_limit(conn, user.organization_id, "max_users", active)
 
     exists = conn.execute(
         "SELECT 1 FROM users WHERE lower(username) = lower(%s)", (body.username,)
@@ -88,11 +114,13 @@ def create_user(body: UserCreate, user: CurrentUser = Depends(require("users.man
 
     row = conn.execute(
         f"""
-        INSERT INTO users (username, full_name, email, role, password_hash, must_change_password)
-        VALUES (%s, %s, %s, %s, %s, true)
+        INSERT INTO users (username, full_name, email, role, password_hash, must_change_password,
+                           organization_id, location_id)
+        VALUES (%s, %s, %s, %s, %s, true, %s, %s)
         RETURNING {USER_COLUMNS}
         """,
-        (body.username, body.full_name, blank_to_none(body.email), body.role, hash_password(body.password)),
+        (body.username, body.full_name, blank_to_none(body.email), body.role, hash_password(body.password),
+         user.organization_id, body.location_id),
     ).fetchone()
     audit.record(conn, user, "CREATE", "user", row["id"], None,
                  {"username": row["username"], "full_name": row["full_name"], "role": row["role"]})
@@ -103,7 +131,8 @@ def create_user(body: UserCreate, user: CurrentUser = Depends(require("users.man
 @router.put("/users/{user_id}")
 def update_user(user_id: int, body: UserUpdate, user: CurrentUser = Depends(require("users.manage")),
                 conn: psycopg.Connection = Depends(get_db)):
-    old = _get(conn, user_id)
+    old = _get(conn, user_id, user.organization_id)
+    _check_location(conn, body.location_id)
 
     if user_id == user.id and (not body.is_active or body.role != old["role"]):
         raise HTTPException(status_code=400, detail="You cannot deactivate yourself or change your own role")
@@ -111,23 +140,24 @@ def update_user(user_id: int, body: UserUpdate, user: CurrentUser = Depends(requ
     removing_admin = old["role"] == "ADMINISTRATOR" and old["is_active"] and (
         body.role != "ADMINISTRATOR" or not body.is_active
     )
-    if removing_admin and _active_admins(conn) <= 1:
+    if removing_admin and _active_admins(conn, user.organization_id) <= 1:
         raise HTTPException(status_code=400, detail="At least one active administrator is required")
 
     row = conn.execute(
         f"""
-        UPDATE users SET full_name = %s, email = %s, role = %s, is_active = %s,
+        UPDATE users SET full_name = %s, email = %s, role = %s, is_active = %s, location_id = %s,
                updated_at = CURRENT_TIMESTAMP
-        WHERE id = %s
+        WHERE id = %s AND organization_id = %s
         RETURNING {USER_COLUMNS}
         """,
-        (body.full_name, blank_to_none(body.email), body.role, body.is_active, user_id),
+        (body.full_name, blank_to_none(body.email), body.role, body.is_active, body.location_id,
+         user_id, user.organization_id),
     ).fetchone()
 
     if not body.is_active or body.role != old["role"]:
         revoke_all_sessions(conn, user_id)
 
-    fields = ["full_name", "email", "role", "is_active"]
+    fields = ["full_name", "email", "role", "is_active", "location_id"]
     before, after = audit.changed_fields({k: old[k] for k in fields}, {k: row[k] for k in fields})
     audit.record(conn, user, "UPDATE", "user", user_id, before, after)
     conn.commit()
@@ -137,7 +167,7 @@ def update_user(user_id: int, body: UserUpdate, user: CurrentUser = Depends(requ
 @router.post("/users/{user_id}/reset-password")
 def reset_password(user_id: int, body: PasswordReset, user: CurrentUser = Depends(require("users.manage")),
                    conn: psycopg.Connection = Depends(get_db)):
-    target = _get(conn, user_id)
+    target = _get(conn, user_id, user.organization_id)
     temporary = body.temporary_password or (secrets.token_urlsafe(9) + "7a")
     validate_password_strength(temporary, target["username"])
 
@@ -145,9 +175,9 @@ def reset_password(user_id: int, body: PasswordReset, user: CurrentUser = Depend
         """
         UPDATE users SET password_hash = %s, must_change_password = true, failed_login_count = 0,
                locked_until = NULL, password_changed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-        WHERE id = %s
+        WHERE id = %s AND organization_id = %s
         """,
-        (hash_password(temporary), user_id),
+        (hash_password(temporary), user_id, user.organization_id),
     )
     revoke_all_sessions(conn, user_id)
     audit.record(conn, user, "PASSWORD_RESET", "user", user_id)

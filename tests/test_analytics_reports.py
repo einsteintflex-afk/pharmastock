@@ -20,8 +20,7 @@ def history(api):
     """Medicine with 60 days of dispensing history: 3 units/day for the last
     30 days, 1 unit/day for the 30 days before (inserted directly so dates
     lie in the past)."""
-    import psycopg
-    from tests.conftest import TEST_URL
+    from tests.conftest import org_connection
 
     medicine = api.post("/medicines", {"name": "Analytics Test", "strength": "5 mg", "dosage_form": "Tablet",
                                        "reorder_level": 20}).json()
@@ -31,7 +30,7 @@ def history(api):
                                  "expiry_date": _day(20), "unit_cost": 2.0}).json()
     late = api.post("/batches", {"medicine_id": medicine["id"], "batch_number": "AN-LATE", "quantity": 200,
                                  "expiry_date": _day(400), "unit_cost": 2.5}).json()
-    with psycopg.connect(TEST_URL) as conn:
+    with org_connection(1) as conn:
         for days_ago in range(1, 61):
             units = 3 if days_ago <= 30 else 1
             conn.execute(

@@ -20,8 +20,9 @@ import psycopg
 from fastapi import Depends, HTTPException, Request
 
 from .config import settings
-from .database import get_db
+from .database import get_db, set_organization
 from .permissions import permissions_for
+from .services import plans
 
 SESSION_COOKIE = "pharmastock_session"
 
@@ -150,6 +151,13 @@ class CurrentUser:
     token: str
     ip: str | None
     permissions: set[str] = field(default_factory=set)
+    organization_id: int | None = None
+    organization_name: str | None = None
+    org_type: str | None = None
+    plan: str | None = None
+    is_platform_admin: bool = False
+    location_id: int | None = None
+    features: set[str] = field(default_factory=set)
 
     def can(self, permission: str) -> bool:
         return permission in self.permissions
@@ -164,10 +172,14 @@ def get_current_user(request: Request, conn: psycopg.Connection = Depends(get_db
     row = conn.execute(
         """
         SELECT users.id, users.username, users.full_name, users.role,
-               users.must_change_password, users.is_active,
+               users.must_change_password, users.is_active, users.organization_id,
+               users.is_platform_admin, users.location_id,
+               organizations.name AS organization_name, organizations.org_type,
+               organizations.plan, organizations.limits, organizations.status AS organization_status,
                sessions.id AS session_id, sessions.expires_at
         FROM sessions
         JOIN users ON users.id = sessions.user_id
+        JOIN organizations ON organizations.id = users.organization_id
         WHERE sessions.token_hash = %s
           AND sessions.revoked_at IS NULL
         """,
@@ -176,6 +188,11 @@ def get_current_user(request: Request, conn: psycopg.Connection = Depends(get_db
 
     if row is None or row["expires_at"] <= datetime.now() or not row["is_active"]:
         raise HTTPException(status_code=401, detail="Session expired or invalid. Please sign in again.")
+    if row["organization_status"] in ("SUSPENDED", "CANCELLED"):
+        raise HTTPException(status_code=401, detail="Your organization's PharmaStock account is not active.")
+
+    # Scope every query in this request to the user's organization.
+    set_organization(conn, row["organization_id"])
 
     conn.execute(
         "UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = %s", (row["session_id"],)
@@ -190,6 +207,13 @@ def get_current_user(request: Request, conn: psycopg.Connection = Depends(get_db
         token=token,
         ip=client_ip(request),
         permissions=permissions_for(row["role"]),
+        organization_id=row["organization_id"],
+        organization_name=row["organization_name"],
+        org_type=row["org_type"],
+        plan=row["plan"],
+        is_platform_admin=row["is_platform_admin"],
+        location_id=row["location_id"],
+        features=set(plans.effective({"plan": row["plan"], "limits": row["limits"]})["features"]),
     )
     request.state.user = user
     return user
@@ -211,3 +235,23 @@ def require(permission: str):
         return user
 
     return dependency
+
+
+def require_feature(feature: str, permission: str = "inventory.read"):
+    """Route dependency: permission AND a plan feature of the organization."""
+
+    def dependency(user: CurrentUser = Depends(require(permission))) -> CurrentUser:
+        if feature not in user.features:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This feature is not included in your organization's plan ({feature}).",
+            )
+        return user
+
+    return dependency
+
+
+def require_platform_admin(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    if user.must_change_password or not user.is_platform_admin:
+        raise HTTPException(status_code=403, detail="Platform administrator access required.")
+    return user

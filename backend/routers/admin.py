@@ -15,11 +15,11 @@ from ..database import get_db
 from ..migrate import status as migration_status
 from ..schemas import Name150
 from ..security import CurrentUser, require
-from ..services import app_settings, notifications
+from ..services import app_settings, notifications, plans
 
 router = APIRouter()
 
-LocationType = Literal["PHARMACY", "STORE", "COLD_CHAIN", "WARD", "BRANCH", "DEPARTMENT"]
+LocationType = Literal["PHARMACY", "STORE", "CENTRAL_STORE", "COLD_CHAIN", "WARD", "BRANCH", "DEPARTMENT"]
 
 
 # ------------------------------------------------------------
@@ -203,6 +203,8 @@ def _validate_parent(conn, parent_id: int | None, location_id: int | None = None
 def create_location(body: LocationBody, user: CurrentUser = Depends(require("locations.manage")),
                     conn: psycopg.Connection = Depends(get_db)):
     _validate_parent(conn, body.parent_id)
+    active = conn.execute("SELECT COUNT(*) AS n FROM locations WHERE is_active").fetchone()["n"]
+    plans.check_limit(conn, user.organization_id, "max_locations", active)
     if conn.execute("SELECT 1 FROM locations WHERE lower(btrim(name)) = lower(%s)", (body.name,)).fetchone():
         raise HTTPException(status_code=409, detail="A location with this name already exists")
     row = conn.execute(

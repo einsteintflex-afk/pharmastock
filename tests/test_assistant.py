@@ -112,10 +112,9 @@ def test_claude_failure_falls_back(monkeypatch):
 
 
 def psycopg_conn():
-    import psycopg
     from psycopg.rows import dict_row
-    from tests.conftest import TEST_URL
-    return psycopg.connect(TEST_URL, row_factory=dict_row)
+    from tests.conftest import org_connection
+    return org_connection(1, row_factory=dict_row)
 
 
 def test_unknown_tool_and_bad_args_are_errors(db):
