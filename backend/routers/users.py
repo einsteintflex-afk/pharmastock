@@ -6,15 +6,18 @@ import secrets
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .. import audit
+from ..config import settings
 from ..database import get_db
 from ..permissions import PERMISSIONS, ROLE_LABELS, ROLE_PERMISSIONS, ROLES
 from ..schemas import Email, Name150, blank_to_none
-from ..security import CurrentUser, hash_password, require, revoke_all_sessions, validate_password_strength
-from ..services import plans
+from ..security import (
+    CurrentUser, create_reset_token, hash_password, require, revoke_all_sessions, validate_password_strength,
+)
+from ..services import delivery, plans
 
 router = APIRouter(tags=["Users"])
 
@@ -184,3 +187,56 @@ def reset_password(user_id: int, body: PasswordReset, user: CurrentUser = Depend
     conn.commit()
     # Shown once to the administrator; the user must change it at next sign-in.
     return {"message": "Password reset", "temporary_password": temporary}
+
+
+class ResetLinkRequest(BaseModel):
+    send_email: bool = True
+
+
+@router.post("/users/{user_id}/reset-link")
+def create_reset_link(user_id: int, body: ResetLinkRequest, request: Request,
+                      user: CurrentUser = Depends(require("users.manage")),
+                      conn: psycopg.Connection = Depends(get_db)):
+    """One-time link (24 hours) with which the user sets their own password;
+    the administrator never learns it. E-mailed when the user has an address."""
+    target = _get(conn, user_id, user.organization_id)
+    token, expires_at = create_reset_token(conn, user_id, "ADMIN_RESET", user.id, 24)
+    base = settings.app_base_url or str(request.base_url).rstrip("/")
+    link = f"{base}/app/#/reset-password?token={token}"
+    emailed = bool(body.send_email and target["email"])
+    if emailed:
+        delivery.enqueue(conn, channel="EMAIL", recipient=target["email"], user_id=user_id,
+                         subject="Set your PharmaStock password",
+                         body=(f"{user.full_name} created a link for you to set a new PharmaStock password "
+                               f"for the account '{target['username']}'.\n\nOpen within 24 hours:\n{link}"))
+    audit.record(conn, user, "PASSWORD_RESET_LINK", "user", user_id, None,
+                 {"expires_at": expires_at, "emailed": emailed})
+    conn.commit()
+    return {"link": link, "expires_at": expires_at, "emailed": emailed}
+
+
+@router.get("/users/{user_id}/sessions")
+def user_sessions(user_id: int, user: CurrentUser = Depends(require("users.manage")),
+                  conn: psycopg.Connection = Depends(get_db)):
+    _get(conn, user_id, user.organization_id)
+    return conn.execute(
+        """
+        SELECT id, created_at, last_seen_at, expires_at, ip_address, user_agent, client_name
+        FROM sessions WHERE user_id = %s AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+        ORDER BY last_seen_at DESC
+        """,
+        (user_id,),
+    ).fetchall()
+
+
+@router.post("/users/{user_id}/revoke-sessions")
+def revoke_user_sessions(user_id: int, user: CurrentUser = Depends(require("users.manage")),
+                         conn: psycopg.Connection = Depends(get_db)):
+    _get(conn, user_id, user.organization_id)
+    if user_id == user.id:
+        revoke_all_sessions(conn, user_id, except_token=user.token)
+    else:
+        revoke_all_sessions(conn, user_id)
+    audit.record(conn, user, "REVOKE_SESSIONS", "user", user_id)
+    conn.commit()
+    return {"message": "Sessions revoked"}

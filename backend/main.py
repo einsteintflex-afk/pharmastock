@@ -7,21 +7,25 @@
 # The frontend is served at /app.
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import database
+from . import database, observability
 from .config import settings
 from .migrate import pending_migrations
+from .ratelimit import SlidingWindow
+from .security import SESSION_COOKIE, client_ip, request_token
 from .routers import (
     admin, analytics, assistant, auth, barcode, delivery, dispensing, inventory, medicines, organizations,
     purchasing, reports, stock, suppliers, transfers, users,
@@ -31,11 +35,15 @@ from .services import notifications, scheduler
 
 VERSION = "2.0.0"
 
-logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+observability.configure_logging(settings.log_level, settings.log_format)
 logger = logging.getLogger("pharmastock")
+ERROR_REPORTING = observability.configure_error_reporting(settings.sentry_dsn, settings.error_webhook_url,
+                                                          settings.environment)
+auth_limiter = SlidingWindow(settings.rate_limit_auth_per_minute)
+api_limiter = SlidingWindow(settings.rate_limit_api_per_minute)
+AUTH_LIMITED_PATHS = {"/auth/login", "/auth/forgot-password", "/auth/reset-password"}
+UNLIMITED_PREFIXES = ("/app", "/health", "/ready", "/metrics")
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 # ============================================================
@@ -178,19 +186,68 @@ app = FastAPI(
 )
 
 
+def _blocked_by_origin(request: Request) -> bool:
+    """State-changing requests from another web origin are refused. The
+    session cookie is SameSite=Strict already; this is defence in depth."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    if origin.rstrip("/") in settings.allowed_origins:
+        return False
+    return urlparse(origin).netloc != request.headers.get("host", "")
+
+
+def _guard(request: Request) -> JSONResponse | None:
+    path = request.scope["path"]
+    # Rate limits.
+    if path in AUTH_LIMITED_PATHS and request.method == "POST":
+        wait = auth_limiter.hit(f"{client_ip(request)}")
+    elif not path.startswith(UNLIMITED_PREFIXES) and path != "/":
+        token = request_token(request)
+        key = f"t:{hashlib.sha256(token.encode()).hexdigest()[:24]}" if token else f"ip:{client_ip(request)}"
+        wait = api_limiter.hit(key)
+    else:
+        wait = None
+    if wait is not None:
+        return JSONResponse(status_code=429, headers={"Retry-After": str(int(wait) + 1)},
+                            content={"detail": "Too many requests. Please wait a moment and try again."})
+    # CSRF: other origins may not change state; cookie-authenticated
+    # requests must carry the application's custom header (a cross-site form
+    # or simple request cannot set it).
+    if request.method in UNSAFE_METHODS:
+        if _blocked_by_origin(request):
+            return JSONResponse(status_code=403, content={"detail": "Cross-origin request refused"})
+        uses_cookie = SESSION_COOKIE in request.cookies and not request.headers.get("authorization")
+        if uses_cookie and request.headers.get("x-requested-with") != "PharmaStock":
+            return JSONResponse(status_code=403, content={"detail": "Missing request header (CSRF protection)"})
+    return None
+
+
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     request_id = uuid.uuid4().hex[:12]
     request.state.request_id = request_id
+    token = observability.request_id_var.set(request_id)
     started = time.perf_counter()
 
-    response = await call_next(request)
+    # Versioned base path for mobile and integration clients: /api/v1/x == /x.
+    if request.scope["path"].startswith("/api/v1/"):
+        request.scope["path"] = request.scope["path"][7:]
+        request.scope["raw_path"] = request.scope["path"].encode()
 
-    elapsed = (time.perf_counter() - started) * 1000
+    try:
+        response = _guard(request) or await call_next(request)
+    finally:
+        observability.request_id_var.reset(token)
+
+    elapsed = time.perf_counter() - started
+    route = request.scope.get("route")
+    observability.metrics.observe(request.method, getattr(route, "path", "unmatched"), response.status_code,
+                                  elapsed)
     user = getattr(request.state, "user", None)
     logger.info(
         "%s %s %s %.0fms user=%s rid=%s",
-        request.method, request.url.path, response.status_code, elapsed,
+        request.method, request.url.path, response.status_code, elapsed * 1000,
         user.username if user else "-", request_id,
     )
 
@@ -268,6 +325,7 @@ async def validation_error(request: Request, error: RequestValidationError):
 async def unexpected_error(request: Request, error: Exception):
     request_id = getattr(request.state, "request_id", "-")
     logger.exception("Unhandled error rid=%s %s %s", request_id, request.method, request.url.path)
+    observability.report_error(error, request_id=request_id, method=request.method, path=request.url.path)
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error", "request_id": request_id},
@@ -292,6 +350,36 @@ def health():
     except Exception:
         logger.exception("Health check failed")
         return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
+
+
+@app.get("/ready", tags=["System"])
+def ready():
+    """Readiness: database reachable and schema up to date (for load balancers
+    and orchestrators). /health is the cheaper liveness check."""
+    try:
+        with database.pool.connection() as conn:
+            pending = pending_migrations(conn)
+            conn.commit()
+    except Exception:
+        logger.exception("Readiness check failed")
+        return JSONResponse(status_code=503, content={"status": "not ready", "database": "unavailable"})
+    if pending:
+        return JSONResponse(status_code=503, content={"status": "not ready", "pending_migrations": pending})
+    return {"status": "ready", "database": "connected", "migrations": "current", "version": VERSION,
+            "error_reporting": ERROR_REPORTING}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics(request: Request):
+    if settings.metrics_token:
+        if request.headers.get("authorization", "") != f"Bearer {settings.metrics_token}":
+            return JSONResponse(status_code=401, content={"detail": "Metrics token required"})
+    elif settings.is_production:
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    stats = database.pool.get_stats() if database.pool else {}
+    extra = {f"pharmastock_db_pool_{key}": value for key, value in stats.items()
+             if key in ("pool_size", "pool_available", "requests_waiting", "requests_num", "connections_errors")}
+    return Response(observability.metrics.render(extra), media_type="text/plain; version=0.0.4")
 
 
 for module in (auth, users, organizations, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,

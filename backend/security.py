@@ -95,16 +95,36 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_session(conn: psycopg.Connection, user_id: int, request: Request) -> tuple[str, datetime]:
+def create_session(conn: psycopg.Connection, user_id: int, request: Request,
+                   client_name: str | None = None) -> tuple[str, datetime]:
     token = secrets.token_urlsafe(32)
     expires_at = datetime.now() + timedelta(hours=settings.session_hours)
     conn.execute(
         """
-        INSERT INTO sessions (user_id, token_hash, expires_at, ip_address, user_agent)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO sessions (user_id, token_hash, expires_at, ip_address, user_agent, client_name)
+        VALUES (%s, %s, %s, %s, %s, %s)
         """,
         (user_id, _hash_token(token), expires_at, client_ip(request),
-         (request.headers.get("user-agent") or "")[:255]),
+         (request.headers.get("user-agent") or "")[:255], client_name),
+    )
+    return token, expires_at
+
+
+def token_hash(token: str) -> str:
+    return _hash_token(token)
+
+
+def create_reset_token(conn: psycopg.Connection, user_id: int, purpose: str, created_by: int | None,
+                       hours: int) -> tuple[str, datetime]:
+    """One-time password reset token; earlier unused tokens of the user are voided."""
+    conn.execute("UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP "
+                 "WHERE user_id = %s AND used_at IS NULL", (user_id,))
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(hours=hours)
+    conn.execute(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, created_by, purpose) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (user_id, _hash_token(token), expires_at, created_by, purpose),
     )
     return token, expires_at
 

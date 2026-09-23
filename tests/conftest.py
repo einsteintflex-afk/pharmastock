@@ -33,6 +33,9 @@ os.environ["NOTIFICATION_REFRESH_MINUTES"] = "600"
 os.environ["DELIVERY_INTERVAL_SECONDS"] = "36000"
 os.environ["SMTP_HOST"] = ""
 os.environ["SMS_PROVIDER"] = "none"
+# Limits are exercised by dedicated tests (which lower them); the suite itself is fast.
+os.environ["RATE_LIMIT_API_PER_MINUTE"] = "0"
+os.environ["RATE_LIMIT_AUTH_PER_MINUTE"] = "0"
 os.environ["LOG_LEVEL"] = "WARNING"
 
 PASSWORD = "Test-pass-2026"

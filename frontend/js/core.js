@@ -139,7 +139,8 @@ export async function api(path, { method = "GET", body, params, raw = false } = 
         response = await fetch(url, {
             method,
             credentials: "same-origin",
-            headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+            // The custom header is the CSRF guard for cookie sessions (see backend/main.py).
+            headers: { "X-Requested-With": "PharmaStock", ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
             body: body !== undefined ? JSON.stringify(body) : undefined,
         });
     } catch {

@@ -58,6 +58,16 @@ class Settings:
     sms_webhook_token: str | None = None
     delivery_interval_seconds: int = 60
     app_base_url: str = ""
+    # Observability
+    log_format: str = "text"          # text | json
+    error_webhook_url: str | None = None
+    sentry_dsn: str | None = None
+    metrics_token: str | None = None
+    # Abuse protection
+    rate_limit_auth_per_minute: int = 10
+    rate_limit_api_per_minute: int = 600
+    # Extra origins allowed to make state-changing requests (same origin is always allowed).
+    allowed_origins: tuple[str, ...] = ()
 
     @property
     def is_production(self) -> bool:
@@ -100,6 +110,13 @@ def load_settings() -> Settings:
         sms_webhook_token=os.getenv("SMS_WEBHOOK_TOKEN") or None,
         delivery_interval_seconds=_int("DELIVERY_INTERVAL_SECONDS", 60),
         app_base_url=os.getenv("APP_BASE_URL", "").rstrip("/"),
+        log_format=os.getenv("LOG_FORMAT", "text").lower(),
+        error_webhook_url=os.getenv("ERROR_WEBHOOK_URL") or None,
+        sentry_dsn=os.getenv("SENTRY_DSN") or None,
+        metrics_token=os.getenv("METRICS_TOKEN") or None,
+        rate_limit_auth_per_minute=_int("RATE_LIMIT_AUTH_PER_MINUTE", 10),
+        rate_limit_api_per_minute=_int("RATE_LIMIT_API_PER_MINUTE", 600),
+        allowed_origins=tuple(o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()),
     )
 
 

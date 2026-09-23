@@ -13,11 +13,11 @@ from .. import audit
 from ..config import settings
 from ..database import get_db, set_organization
 from ..permissions import ROLE_LABELS, permissions_for
-from ..services import plans
+from ..services import delivery, plans
 from ..security import (
-    SESSION_COOKIE, CurrentUser, client_ip, create_session, get_current_user, hash_password,
-    revoke_all_sessions, revoke_session, validate_password_strength, verify_password,
-    verify_password_or_dummy,
+    SESSION_COOKIE, CurrentUser, client_ip, create_reset_token, create_session, get_current_user,
+    hash_password, revoke_all_sessions, revoke_session, token_hash, validate_password_strength,
+    verify_password, verify_password_or_dummy,
 )
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -26,6 +26,17 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=50)
     password: str = Field(min_length=1, max_length=200)
+    # Optional device / app name shown in the signed-in devices list.
+    client_name: str | None = Field(default=None, max_length=100)
+
+
+class ForgotPasswordRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=50)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+    new_password: str = Field(min_length=1, max_length=200)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -122,7 +133,7 @@ def login(body: LoginRequest, request: Request, conn: psycopg.Connection = Depen
         """,
         (user["id"],),
     )
-    token, expires_at = create_session(conn, user["id"], request)
+    token, expires_at = create_session(conn, user["id"], request, (body.client_name or "").strip() or None)
     audit.record(conn, None, "LOGIN", "user", user["id"], None, None, username=user["username"], ip=ip)
     conn.commit()
 
@@ -190,3 +201,119 @@ def change_password(body: ChangePasswordRequest, user: CurrentUser = Depends(get
     audit.record(conn, user, "PASSWORD_CHANGED", "user", user.id)
     conn.commit()
     return {"message": "Password changed"}
+
+
+# ------------------------------------------------------------
+# Signed-in devices
+# ------------------------------------------------------------
+
+@router.get("/sessions")
+def my_sessions(user: CurrentUser = Depends(get_current_user), conn: psycopg.Connection = Depends(get_db)):
+    rows = conn.execute(
+        """
+        SELECT id, created_at, last_seen_at, expires_at, ip_address, user_agent, client_name,
+               token_hash = %s AS current
+        FROM sessions
+        WHERE user_id = %s AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP
+        ORDER BY last_seen_at DESC
+        """,
+        (token_hash(user.token), user.id),
+    ).fetchall()
+    return rows
+
+
+@router.delete("/sessions/{session_id}")
+def revoke_my_session(session_id: int, user: CurrentUser = Depends(get_current_user),
+                      conn: psycopg.Connection = Depends(get_db)):
+    row = conn.execute(
+        "UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP WHERE id = %s AND user_id = %s AND revoked_at IS NULL "
+        "RETURNING id, client_name, ip_address",
+        (session_id, user.id),
+    ).fetchone()
+    if row is None:
+        return JSONResponse(status_code=404, content={"detail": "Session not found"})
+    audit.record(conn, user, "REVOKE_SESSION", "user", user.id, None, dict(row))
+    conn.commit()
+    return {"revoked": session_id}
+
+
+@router.post("/logout-others")
+def logout_other_sessions(user: CurrentUser = Depends(get_current_user),
+                          conn: psycopg.Connection = Depends(get_db)):
+    revoke_all_sessions(conn, user.id, except_token=user.token)
+    audit.record(conn, user, "LOGOUT_OTHER_SESSIONS", "user", user.id)
+    conn.commit()
+    return {"message": "All other devices were signed out"}
+
+
+# ------------------------------------------------------------
+# Password reset
+# ------------------------------------------------------------
+
+RESET_HOURS = 1
+
+
+@router.post("/forgot-password", status_code=202)
+def forgot_password(body: ForgotPasswordRequest, request: Request, conn: psycopg.Connection = Depends(get_db)):
+    """E-mail a one-time reset link to the user's address, if they have one.
+    The response is identical whether or not the account exists."""
+    generic = {"message": "If the account exists and has an e-mail address, a reset link has been sent. "
+                          "Otherwise ask your administrator to reset your password."}
+    user = conn.execute(
+        """
+        SELECT users.id, users.username, users.email, users.is_active, users.organization_id,
+               organizations.status
+        FROM users JOIN organizations ON organizations.id = users.organization_id
+        WHERE lower(username) = lower(%s)
+        """,
+        (body.username.strip(),),
+    ).fetchone()
+    if user is None or not user["is_active"] or not user["email"] or user["status"] in ("SUSPENDED", "CANCELLED"):
+        return generic
+    set_organization(conn, user["organization_id"])
+    token, expires_at = create_reset_token(conn, user["id"], "FORGOT", None, RESET_HOURS)
+    base = settings.app_base_url or str(request.base_url).rstrip("/")
+    delivery.enqueue(
+        conn, channel="EMAIL", recipient=user["email"], user_id=user["id"],
+        subject="PharmaStock password reset",
+        body=(f"A password reset was requested for your PharmaStock account '{user['username']}'.\n\n"
+              f"Open this link within {RESET_HOURS} hour to choose a new password:\n"
+              f"{base}/app/#/reset-password?token={token}\n\n"
+              "If you did not ask for this, ignore this e-mail; your password is unchanged."),
+    )
+    audit.record(conn, None, "PASSWORD_RESET_REQUESTED", "user", user["id"], None,
+                 {"expires_at": expires_at}, username=user["username"], ip=client_ip(request))
+    conn.commit()
+    return generic
+
+
+@router.post("/reset-password")
+def reset_password(body: ResetPasswordRequest, request: Request, conn: psycopg.Connection = Depends(get_db)):
+    row = conn.execute(
+        """
+        SELECT t.id, t.user_id, t.expires_at, t.used_at, users.username, users.organization_id, users.is_active
+        FROM password_reset_tokens t JOIN users ON users.id = t.user_id
+        WHERE t.token_hash = %s
+        FOR UPDATE OF t
+        """,
+        (token_hash(body.token),),
+    ).fetchone()
+    if row is None or row["used_at"] or row["expires_at"] <= datetime.now() or not row["is_active"]:
+        return JSONResponse(status_code=400, content={"detail": "This reset link is invalid or has expired. "
+                                                                "Request a new one."})
+    validate_password_strength(body.new_password, row["username"])
+    set_organization(conn, row["organization_id"])
+    conn.execute(
+        """
+        UPDATE users SET password_hash = %s, must_change_password = false, failed_login_count = 0,
+               locked_until = NULL, password_changed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s
+        """,
+        (hash_password(body.new_password), row["user_id"]),
+    )
+    conn.execute("UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = %s", (row["id"],))
+    revoke_all_sessions(conn, row["user_id"])
+    audit.record(conn, None, "PASSWORD_RESET_COMPLETED", "user", row["user_id"], None, None,
+                 username=row["username"], ip=client_ip(request))
+    conn.commit()
+    return {"message": "Password changed. You can now sign in."}
