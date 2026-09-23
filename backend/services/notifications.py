@@ -15,7 +15,7 @@ import logging
 
 import psycopg
 
-from . import analytics, inventory
+from . import analytics, delivery, inventory
 
 logger = logging.getLogger("pharmastock.notifications")
 
@@ -23,7 +23,7 @@ _SEVERITY = {"EXPIRED": "CRITICAL", "CRITICAL": "CRITICAL", "URGENT": "WARNING"}
 
 
 def _upsert(conn, *, key, category, severity, title, message, entity_type, entity_id) -> None:
-    conn.execute(
+    row = conn.execute(
         """
         INSERT INTO notifications (category, severity, title, message, entity_type, entity_id, dedupe_key)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -36,9 +36,12 @@ def _upsert(conn, *, key, category, severity, title, message, entity_type, entit
                   OR notifications.resolved_at IS NOT NULL
                 THEN CURRENT_TIMESTAMP ELSE notifications.updated_at END,
             resolved_at = NULL
+        RETURNING id, (xmax = 0) AS inserted
         """,
         (category, severity, title, message, entity_type, str(entity_id), key),
-    )
+    ).fetchone()
+    if row["inserted"]:
+        delivery.enqueue_for_notification(conn, row["id"], severity, title, message)
 
 
 def refresh(conn: psycopg.Connection) -> dict:
@@ -125,15 +128,18 @@ def event(
 ) -> None:
     """Record a one-off event notification (resolved immediately: it is
     informational and never 'clears')."""
-    conn.execute(
+    row = conn.execute(
         """
         INSERT INTO notifications
             (category, severity, title, message, entity_type, entity_id, dedupe_key, resolved_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
         ON CONFLICT (organization_id, dedupe_key) DO NOTHING
+        RETURNING id
         """,
         (category, severity, title, message, entity_type, str(entity_id), key),
-    )
+    ).fetchone()
+    if row:
+        delivery.enqueue_for_notification(conn, row["id"], severity, title, message)
 
 
 def open_item(

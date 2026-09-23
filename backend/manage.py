@@ -6,6 +6,7 @@
 #   python -m backend.manage reset-password        reset any user's password (prompts)
 #   python -m backend.manage refresh-notifications (all organizations)
 #   python -m backend.manage reconcile             batches vs ledger (all organizations)
+#   python -m backend.manage process-deliveries    run due scheduled reports, send e-mail / SMS
 
 import getpass
 import json
@@ -15,7 +16,7 @@ from fastapi import HTTPException
 
 from .database import active_organization_ids, connect, set_organization
 from .security import hash_password, validate_password_strength
-from .services import notifications, organizations, stock
+from .services import delivery, notifications, organizations, scheduler, stock
 
 
 def _password(username: str) -> str:
@@ -125,8 +126,15 @@ def main() -> None:
             with connect(organization_id) as conn:
                 rows = stock.reconciliation(conn)
             print(f"Organization {organization_id}:", "stock ledger reconciled." if not rows else rows)
+    elif command == "process-deliveries":
+        for organization_id in _organizations():
+            with connect(organization_id) as conn:
+                ran = scheduler.run_due(conn)
+                print(f"Organization {organization_id}: {ran} scheduled report(s) run,",
+                      delivery.process_outbox(conn, limit=1000))
     else:
-        print("Commands: create-admin, create-organization, reset-password, refresh-notifications, reconcile")
+        print("Commands: create-admin, create-organization, reset-password, refresh-notifications, reconcile, "
+              "process-deliveries")
 
 
 if __name__ == "__main__":

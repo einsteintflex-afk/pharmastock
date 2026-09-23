@@ -23,10 +23,11 @@ from . import database
 from .config import settings
 from .migrate import pending_migrations
 from .routers import (
-    admin, analytics, assistant, auth, barcode, dispensing, inventory, medicines, organizations, purchasing, reports, stock,
-    suppliers, transfers, users,
+    admin, analytics, assistant, auth, barcode, delivery, dispensing, inventory, medicines, organizations,
+    purchasing, reports, stock, suppliers, transfers, users,
 )
-from .services import notifications
+from .services import delivery as delivery_service
+from .services import notifications, scheduler
 
 VERSION = "2.0.0"
 
@@ -104,6 +105,21 @@ def _refresh_notifications() -> None:
         logger.exception("Notification refresh failed")
 
 
+def _process_deliveries() -> None:
+    """Run due scheduled reports and send queued e-mail / SMS, per organization."""
+    try:
+        with database.pool.connection() as conn:
+            organization_ids = database.active_organization_ids(conn)
+        for organization_id in organization_ids:
+            with database.organization_connection(organization_id) as conn:
+                ran = scheduler.run_due(conn)
+                sent = delivery_service.process_outbox(conn)
+            if ran or any(sent.values()):
+                logger.info("Deliveries org=%s: scheduled reports run=%s, outbox=%s", organization_id, ran, sent)
+    except Exception:
+        logger.exception("Delivery worker failed")
+
+
 def _check_database_role() -> None:
     """Row level security does not apply to superusers / BYPASSRLS roles."""
     with database.connect() as conn:
@@ -124,18 +140,25 @@ async def _notification_loop() -> None:
         await asyncio.sleep(settings.notification_refresh_minutes * 60)
 
 
+async def _delivery_loop() -> None:
+    while True:
+        await asyncio.sleep(settings.delivery_interval_seconds)
+        await asyncio.to_thread(_process_deliveries)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _check_migrations()
     _check_database_role()
     _bootstrap_admin()
     database.open_pool()
-    task = asyncio.create_task(_notification_loop())
+    tasks = [asyncio.create_task(_notification_loop()), asyncio.create_task(_delivery_loop())]
     logger.info("PharmaStock API %s started (%s)", VERSION, settings.environment)
     try:
         yield
     finally:
-        task.cancel()
+        for task in tasks:
+            task.cancel()
         database.close_pool()
 
 
@@ -272,7 +295,7 @@ def health():
 
 
 for module in (auth, users, organizations, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,
-               analytics, reports, admin, assistant):
+               analytics, reports, delivery, admin, assistant):
     app.include_router(module.router)
 
 

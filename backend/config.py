@@ -44,6 +44,20 @@ class Settings:
     bootstrap_admin_password: str | None
     log_level: str
     frontend_dir: Path
+    # Outgoing e-mail (SMTP). Delivery is disabled while smtp_host is empty.
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str | None = None
+    smtp_security: str = "starttls"   # starttls | ssl | none
+    # SMS: "none", "log" (development: write to the log) or "webhook"
+    # (POST JSON {to, message} to SMS_WEBHOOK_URL - adapt to any gateway).
+    sms_provider: str = "none"
+    sms_webhook_url: str | None = None
+    sms_webhook_token: str | None = None
+    delivery_interval_seconds: int = 60
+    app_base_url: str = ""
 
     @property
     def is_production(self) -> bool:
@@ -75,6 +89,17 @@ def load_settings() -> Settings:
         bootstrap_admin_password=os.getenv("BOOTSTRAP_ADMIN_PASSWORD") or None,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         frontend_dir=PROJECT_ROOT / "frontend",
+        smtp_host=os.getenv("SMTP_HOST") or None,
+        smtp_port=_int("SMTP_PORT", 587),
+        smtp_username=os.getenv("SMTP_USERNAME") or None,
+        smtp_password=os.getenv("SMTP_PASSWORD") or None,
+        smtp_from=os.getenv("SMTP_FROM") or None,
+        smtp_security=os.getenv("SMTP_SECURITY", "starttls").lower(),
+        sms_provider=os.getenv("SMS_PROVIDER", "none").lower(),
+        sms_webhook_url=os.getenv("SMS_WEBHOOK_URL") or None,
+        sms_webhook_token=os.getenv("SMS_WEBHOOK_TOKEN") or None,
+        delivery_interval_seconds=_int("DELIVERY_INTERVAL_SECONDS", 60),
+        app_base_url=os.getenv("APP_BASE_URL", "").rstrip("/"),
     )
 
 
