@@ -14,13 +14,13 @@
 import json
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import psycopg
 
 from ..config import settings
-from . import analytics, app_settings, inventory, stock
+from . import analytics, app_settings, inventory, stock, trends
 
 logger = logging.getLogger("pharmastock.assistant")
 
@@ -186,6 +186,86 @@ def tool_forecast(conn, horizon_days: int = 30, **_):
     return result
 
 
+def tool_monthly_summary(conn, month: str | None = None, **_):
+    data = trends.monthly_summary(conn, month)
+    data["currency"] = app_settings.get(conn, "currency.symbol")
+    return data
+
+
+def tool_stock_changes(conn, date_from: str | None = None, date_to: str | None = None, **_):
+    start = date.fromisoformat(date_from) if date_from else date.today().replace(day=1)
+    end = date.fromisoformat(date_to) if date_to else date.today()
+    if start > end:
+        return {"error": "date_from must be on or before date_to"}
+    data = trends.stock_changes(conn, start, end + timedelta(days=1))
+    data["note"] = "Net change excludes internal transfers; adjustments are signed (negative = count was lower)."
+    return data
+
+
+def tool_top_suppliers(conn, days: int = 365, **_):
+    days = max(30, min(int(days), 1825))
+    data = trends.supplier_performance(conn, days)
+    keys = ["supplier", "is_active", "orders", "open_orders", "ordered_value", "received_value",
+            "share_of_spend_percent", "fill_rate_percent", "average_lead_time_days", "last_order_date",
+            "last_receipt_date", "products_with_price_changes"]
+    result = _trim([_pick(r, keys) for r in data["suppliers"] if r["orders"]])
+    result.update({"period_days": days, "method": data["method"],
+                   "currency": app_settings.get(conn, "currency.symbol")})
+    return result
+
+
+def tool_overstock(conn, min_days_of_stock: int = 180, **_):
+    min_days = max(30, min(int(min_days_of_stock), 3650))
+    result = _trim(trends.overstock(conn, min_days))
+    result["definition"] = (f"Usable stock covering {min_days}+ days at the current dispensing rate, "
+                            "or stock with nothing dispensed in 90 days.")
+    result["currency"] = app_settings.get(conn, "currency.symbol")
+    return result
+
+
+def tool_expired_stock(conn, **_):
+    value = analytics.valuation(conn)
+    rows = inventory.batches(conn, status="EXPIRED", include_empty=False)
+    keys = ["medicine", "strength", "batch_number", "location", "quantity", "expiry_date", "stock_value"]
+    written_off = trends.expiry_trends(conn, 12)["written_off_by_month"]
+    return {
+        "currency": app_settings.get(conn, "currency.symbol"),
+        "expired_on_shelf": value["by_expiry_status"]["EXPIRED"],
+        "batches": _trim([_pick(r, keys) for r in rows]),
+        "written_off_last_12_months": {"units": sum(m["units"] for m in written_off),
+                                       "value": round(sum(m["value"] for m in written_off), 2)},
+        "note": "Expired units must not be dispensed; record them as EXPIRED write-offs when disposed of.",
+    }
+
+
+def tool_stockouts(conn, days: int = 90, **_):
+    data = trends.stockouts(conn, max(7, min(int(days), 365)))
+    keys = ["medicine", "strength", "usable_stock", "currently_out", "stockout_days", "stockout_episodes",
+            "availability_percent", "last_stockout_day"]
+    result = _trim([_pick(r, keys) for r in data["medicines"] if r["stockout_days"] or r["currently_out"]])
+    result.update({"summary": data["summary"], "limitations": data["limitations"], "days": data["days"]})
+    return result
+
+
+def tool_locations(conn, **_):
+    rows = trends.location_analytics(conn)
+    keys = ["location", "location_type", "medicines_in_stock", "usable_units", "expired_units", "stock_value",
+            "value_expiring_soon", "dispensed_30d", "transferred_in_30d", "transferred_out_30d", "open_transfers"]
+    result = _trim([_pick(r, keys) for r in rows])
+    result["currency"] = app_settings.get(conn, "currency.symbol")
+    return result
+
+
+def tool_open_transfers(conn, **_):
+    from . import transfers
+
+    rows = conn.execute(transfers.LIST_SQL + " WHERE t.status IN ('REQUESTED', 'APPROVED', 'DISPATCHED') "
+                        "ORDER BY t.requested_at").fetchall()
+    keys = ["transfer_number", "request_type", "priority", "status", "from_location", "to_location", "items",
+            "units_requested", "requested_at", "requested_by_name"]
+    return _trim([_pick(r, keys) for r in rows])
+
+
 TOOLS = {
     "inventory_overview": (tool_inventory_overview,
         "Headline figures: medicines, units, stock value, expiry status counts, low stock, reorder count, expiry-risk totals.",
@@ -209,8 +289,30 @@ TOOLS = {
     "valuation": (tool_valuation, "Stock value at cost: total, usable, by expiry status (incl. approaching expiry) and by location.", {}),
     "medicine_stock": (tool_medicine_stock, "Stock, status and batches for a specific medicine.",
         {"medicine_name": {"type": "string"}}),
-    "demand_forecast": (tool_forecast, "Forecast demand per medicine and whether usable stock covers it.",
+    "demand_forecast": (tool_forecast,
+        "Forecast demand per medicine, whether usable stock covers it, projected stock-out date, data "
+        "sufficiency and confidence.",
         {"horizon_days": {"type": "integer", "minimum": 7, "maximum": 180}}),
+    "monthly_summary": (tool_monthly_summary,
+        "Summary of one calendar month: stock received/dispensed/written off, dispensing sales, purchasing, "
+        "transfers and top dispensed medicines. Defaults to the current month.",
+        {"month": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$", "description": "YYYY-MM"}}),
+    "stock_changes": (tool_stock_changes,
+        "How stock changed per medicine over a period (received, dispensed, written off, adjustments, net). "
+        "Defaults to this month so far.",
+        {"date_from": {"type": "string", "format": "date"}, "date_to": {"type": "string", "format": "date"}}),
+    "top_suppliers": (tool_top_suppliers,
+        "Suppliers ranked by purchase value, with share of spend, fill rate, lead time and price changes.",
+        {"days": {"type": "integer", "minimum": 30, "maximum": 1825}}),
+    "overstock": (tool_overstock,
+        "Medicines with high stock but low consumption (many days of stock or no recent dispensing), by value.",
+        {"min_days_of_stock": {"type": "integer", "minimum": 30, "maximum": 3650}}),
+    "expired_stock": (tool_expired_stock,
+        "Expired stock still on the shelf (units, value, batches) and expiry write-offs over 12 months.", {}),
+    "stockouts": (tool_stockouts, "Stock-out history: days each medicine had no usable stock, and what is out now.",
+        {"days": {"type": "integer", "minimum": 7, "maximum": 365}}),
+    "locations": (tool_locations, "Stock, value, expiring value and activity for each location / ward.", {}),
+    "open_transfers": (tool_open_transfers, "Transfers and ward requisitions awaiting approval, dispatch or receipt.", {}),
 }
 
 REQUIRED = {"fefo_order": ["medicine_name"], "medicine_stock": ["medicine_name"]}
@@ -321,6 +423,79 @@ def _rules(conn, question: str) -> dict:
     medicine = _medicine_in_question(conn, question)
     number = re.search(r"\b(\d{1,7})\b", q)
 
+    if "summary" in q or "summar" in q or "how did we do" in q or "month" in q and "report" in q:
+        data = tool_monthly_summary(conn)
+        m, d = data["movements"], data["dispensing"]
+        lines = [f"**Summary for {data['month']}**" + ("" if data["period"]["complete"] else " (month to date)") + ":",
+                 f"- Received {m['received']:,} units; dispensed {m['dispensed']:,} units; written off "
+                 f"{m['written_off']:,} units; net change {m['net_change']:+,} units.",
+                 f"- Dispensing: {d['dispensations']:,} completed ({d['voided']} voided), sales "
+                 f"{_money(currency, d['sales_total'])}.",
+                 f"- Purchasing: {data['purchasing']['orders']} orders worth "
+                 f"{_money(currency, data['purchasing']['ordered_value'])}.",
+                 f"- Transfers received: {data['transfers_received']}."]
+        for kind, loss in data["write_offs"].items():
+            lines.append(f"- {kind.title()} write-offs: {loss['units']:,} units, {_money(currency, loss['value'])}.")
+        if data["top_dispensed"]:
+            lines.append("Top dispensed: " + ", ".join(f"{t['medicine']} ({t['units']})" for t in data["top_dispensed"]))
+        return {"answer": "\n".join(lines), "tools_used": ["monthly_summary"]}
+
+    if "chang" in q and ("stock" in q or "month" in q or "week" in q):
+        data = tool_stock_changes(conn)
+        if not data["rows"]:
+            return {"answer": "No stock movements have been recorded this month.", "tools_used": ["stock_changes"]}
+        t = data["totals"]
+        lines = [f"Stock changes {data['date_from']} to {data['date_to']}: received {t['received']:,}, dispensed "
+                 f"{t['dispensed']:,}, written off {t['written_off']:,}, net {t['net_change']:+,} units.",
+                 "Largest changes:"]
+        lines += [f"- {r['medicine']} {r['strength'] or ''}: {r['net_change']:+,} (in {r['received']}, out "
+                  f"{r['dispensed']} dispensed, {r['written_off']} written off)" for r in data["rows"][:10]]
+        return {"answer": "\n".join(lines), "tools_used": ["stock_changes"]}
+
+    if "supplier" in q:
+        data = tool_top_suppliers(conn)
+        if not data["rows"]:
+            return {"answer": "No purchase orders were placed in the last 12 months.", "tools_used": ["top_suppliers"]}
+        lines = ["Top suppliers by purchase value (last 12 months):"]
+        for r in data["rows"][:10]:
+            extra = []
+            if r["fill_rate_percent"] is not None:
+                extra.append(f"fill rate {r['fill_rate_percent']}%")
+            if r["average_lead_time_days"] is not None:
+                extra.append(f"lead time {r['average_lead_time_days']} days")
+            lines.append(f"- {r['supplier']}: {_money(currency, r['ordered_value'])} "
+                         f"({r['share_of_spend_percent']}% of spend, {r['orders']} orders"
+                         + (", " + ", ".join(extra) if extra else "") + ")")
+        return {"answer": "\n".join(lines), "tools_used": ["top_suppliers"]}
+
+    if any(w in q for w in ("overstock", "over-stock", "too much", "high stock", "excess")):
+        data = tool_overstock(conn)
+        if not data["rows"]:
+            return {"answer": "No medicines hold far more stock than they use.", "tools_used": ["overstock"]}
+        lines = ["High stock with low consumption:"] + [
+            f"- {r['medicine']} {r['strength'] or ''}: {r['usable_stock']:,} units, {r['reason']}, "
+            f"{_money(currency, r['stock_value'])}" for r in data["rows"][:10]]
+        lines.append(data["definition"])
+        return {"answer": "\n".join(lines), "tools_used": ["overstock"]}
+
+    if "expired" in q and ("value" in q or "worth" in q or "how much" in q or "cost" in q):
+        data = tool_expired_stock(conn)
+        e = data["expired_on_shelf"]
+        w = data["written_off_last_12_months"]
+        return {"answer": (f"Expired stock on the shelf: {e['units']:,} units in {e['batches']} batches, worth "
+                           f"{_money(currency, e['value'])}. Written off as expired in the last 12 months: "
+                           f"{w['units']:,} units, {_money(currency, w['value'])}. {data['note']}"),
+                "tools_used": ["expired_stock"]}
+
+    if "stock-out" in q or "stockout" in q or "stock out" in q or "ran out" in q:
+        data = tool_stockouts(conn)
+        if not data["rows"]:
+            return {"answer": "No stock-outs in the last 90 days.", "tools_used": ["stockouts"]}
+        lines = [f"Stock-outs in the last {data['days']} days:"] + [
+            f"- {r['medicine']} {r['strength'] or ''}: {r['stockout_days']} day(s) out"
+            + (" — out now" if r["currently_out"] else "") for r in data["rows"][:10]]
+        return {"answer": "\n".join(lines), "tools_used": ["stockouts"]}
+
     if any(w in q for w in ("fefo", "first expiry", "used first", "use first", "dispense first", "which batch")):
         if not medicine:
             return {"answer": "Which medicine? For example: \"Which batches of Paracetamol should be used first?\"",
@@ -423,8 +598,9 @@ def _rules(conn, question: str) -> dict:
     data = tool_inventory_overview(conn)
     return {
         "answer": (
-            "I can answer questions about expiry risk, reorders, low stock, slow-moving stock, FEFO batch order, "
-            "stock value and consumption. Current overview: "
+            "I can answer questions about expiry risk, reorders, low stock, slow-moving and overstocked items, "
+            "FEFO batch order, stock value, expired stock, stock-outs, suppliers, monthly summaries and stock "
+            "changes. Current overview: "
             f"{data['total_medicines']} medicines, {data['usable_units']:,} usable units worth "
             f"{_money(currency, data['usable_stock_value'])}; {data['expiry_status']['expired']['batches']} expired "
             f"and {data['expiry_status']['critical']['batches']} critical batches; {data['low_stock_count']} low and "

@@ -45,6 +45,12 @@ def test_fefo_allocation_for_quantity(api):
     ("Show expired batches", "expiry_alerts"),
     ("How much Amoxicillin do we have?", "medicine_stock"),
     ("hello", "inventory_overview"),
+    ("Give me a summary of this month", "monthly_summary"),
+    ("How has stock changed this month?", "stock_changes"),
+    ("Who are our top suppliers?", "top_suppliers"),
+    ("Which medicines have high stock but low consumption?", "overstock"),
+    ("What is the value of expired stock?", "expired_stock"),
+    ("Have we had any stock-outs?", "stockouts"),
 ])
 def test_sample_questions(api, question, tool):
     answer = ask(api, question)

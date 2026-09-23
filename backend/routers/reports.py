@@ -28,6 +28,7 @@ def list_reports(user: CurrentUser = Depends(require("analytics.read"))):
     return [
         {"key": key, "name": name, "filters": filters, "formats": ["json", "csv", "xlsx", "pdf"]}
         for key, (name, _, filters) in reports.REPORTS.items()
+        if user.can(reports.REPORT_PERMISSIONS.get(key, "analytics.read"))
     ]
 
 
@@ -47,6 +48,9 @@ def run_report(
 ):
     if report_key not in reports.REPORTS:
         raise HTTPException(status_code=404, detail="Unknown report")
+    needed = reports.REPORT_PERMISSIONS.get(report_key)
+    if needed and not user.can(needed):
+        raise HTTPException(status_code=403, detail=f"This report needs the {needed} permission.")
     if format != "json" and not user.can("reports.export"):
         raise HTTPException(status_code=403, detail="Your role does not allow exporting reports (reports.export).")
 
@@ -56,7 +60,13 @@ def run_report(
         supplier_id=supplier_id, status=status, movement_type=movement_type,
     )
 
+    filters = {k: str(v) for k, v in {"date_from": date_from, "date_to": date_to, "location_id": location_id,
+                                      "supplier_id": supplier_id, "status": status,
+                                      "movement_type": movement_type}.items() if v is not None}
     if format == "json":
+        audit.record(conn, user, "VIEW_REPORT", "report", report_key, None,
+                     {"rows": len(report.rows), "filters": filters})
+        conn.commit()
         return exporters.to_json(report)
 
     if format == "csv":
@@ -67,7 +77,7 @@ def run_report(
         content = exporters.to_pdf(report, user.full_name)
 
     audit.record(conn, user, "EXPORT", "report", report_key, None,
-                 {"format": format, "rows": len(report.rows)})
+                 {"format": format, "rows": len(report.rows), "filters": filters})
     conn.commit()
 
     media_type, extension = MEDIA_TYPES[format]

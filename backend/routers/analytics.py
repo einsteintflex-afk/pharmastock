@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ..database import get_db
 from ..security import CurrentUser, require, require_feature
-from ..services import analytics
+from ..services import analytics, trends
 
 router = APIRouter(tags=["Analytics"])
 
@@ -123,3 +123,44 @@ def turnover(user: CurrentUser = Depends(require_feature("advanced_analytics", "
 def purchasing(user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
                conn: psycopg.Connection = Depends(get_db)):
     return analytics.purchasing_patterns(conn)
+
+
+@router.get("/analytics/stock-trends")
+def stock_trends(months: int = Query(default=12, ge=1, le=36),
+                 user: CurrentUser = Depends(require("analytics.read")),
+                 conn: psycopg.Connection = Depends(get_db)):
+    return trends.stock_trends(conn, months)
+
+
+@router.get("/analytics/expiry-trends")
+def expiry_trends(months: int = Query(default=12, ge=1, le=36),
+                  user: CurrentUser = Depends(require("analytics.read")),
+                  conn: psycopg.Connection = Depends(get_db)):
+    return trends.expiry_trends(conn, months)
+
+
+@router.get("/analytics/locations")
+def location_analytics(user: CurrentUser = Depends(require("analytics.read")),
+                       conn: psycopg.Connection = Depends(get_db)):
+    return trends.location_analytics(conn)
+
+
+@router.get("/analytics/stockouts")
+def stockouts(days: int = Query(default=90, ge=7, le=365),
+              user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
+              conn: psycopg.Connection = Depends(get_db)):
+    return trends.stockouts(conn, days)
+
+
+@router.get("/analytics/suppliers")
+def supplier_performance(days: int = Query(default=365, ge=30, le=1825),
+                         user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
+                         conn: psycopg.Connection = Depends(get_db)):
+    return trends.supplier_performance(conn, days)
+
+
+@router.get("/analytics/purchasing-trends")
+def purchasing_trends(months: int = Query(default=12, ge=1, le=36),
+                      user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
+                      conn: psycopg.Connection = Depends(get_db)):
+    return trends.purchasing_trends(conn, months)

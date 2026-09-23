@@ -102,7 +102,9 @@ def test_valuation(api, history, db):
 
 def test_forecast_and_turnover(api, history):
     forecast = next(r for r in api.get("/analytics/forecast").json() if r["medicine"] == "Analytics Test")
-    assert forecast["forecast_demand"] > 0 and forecast["confidence"] == "HIGH"
+    assert forecast["forecast_demand"] > 0 and forecast["data_sufficiency"] == "ADEQUATE"
+    # Demand tripled half-way through the history, so it is not regular enough for HIGH.
+    assert forecast["confidence"] == "MEDIUM" and forecast["variability"] > 0.5
     assert api.get("/analytics/forecast", params={"horizon_days": 1}).status_code == 422
     turnover = next(r for r in api.get("/analytics/turnover").json() if r["medicine"] == "Analytics Test")
     assert turnover["dispensed_90d"] == 120 and turnover["turnover_90d"] > 0

@@ -7,7 +7,8 @@
 # the returned data so users can see how a number was produced.
 
 import math
-from datetime import date
+import statistics
+from datetime import date, timedelta
 
 import psycopg
 
@@ -43,6 +44,8 @@ def reorder_recommendations(conn: psycopg.Connection, *, only_needed: bool = Fal
 
     results = []
     for item in stock:
+        if not item["is_active"]:
+            continue  # discontinued medicines are never recommended for reorder
         use = usage.get(item["medicine_id"], {})
         daily = use.get("average_daily", 0) or 0
         usable = item["usable_stock"]
@@ -85,6 +88,11 @@ def reorder_recommendations(conn: psycopg.Connection, *, only_needed: bool = Fal
             "reorder_recommended": needed,
             "recommended_quantity": shortfall if needed else 0,
             "reason": reason,
+            "projected_stockout_date": (date.today() + timedelta(days=math.floor(days_of_stock)))
+            if days_of_stock is not None else None,
+            "calculation": (f"target = max(reorder level {item['reorder_level']}, daily use {daily} x "
+                            f"(lead time {cfg['lead_time']} + cover {cfg['cover_days']} days)) = {target}; "
+                            f"suggested = target - usable {usable} - on order {ordered} = {shortfall}"),
         }
         if not only_needed or needed:
             results.append(row)
@@ -254,11 +262,22 @@ def valuation(conn: psycopg.Connection) -> dict:
 # Demand forecast
 # ------------------------------------------------------------
 
+FORECAST_LIMITATIONS = [
+    "Demand is measured as units dispensed; unmet demand during stock-outs is not recorded, so the "
+    "forecast can understate need for medicines that ran out.",
+    "The model assumes recent demand continues; it does not know about seasons, outbreaks, new "
+    "prescribers or price changes.",
+    "Usable stock excludes expired and held (quarantined / recalled) batches, but not units likely "
+    "to expire before use (see expiry risk).",
+    "Forecasts are decision support for purchasing, not clinical guidance.",
+]
+
+
 def forecast(conn: psycopg.Connection, horizon_days: int = 30) -> list[dict]:
     """Forecast demand with simple exponential smoothing (alpha 0.5) over the
-    last 12 weekly dispensing totals. Returns the forecast for the horizon
-    and whether usable stock covers it. With little history the forecast is
-    flagged as low confidence."""
+    last 12 weekly dispensing totals. Returns the forecast for the horizon,
+    whether usable stock covers it, the projected stock-out date, and how
+    much history the forecast rests on (data_sufficiency, confidence)."""
     rows = conn.execute(
         """
         WITH weeks AS (
@@ -278,21 +297,64 @@ def forecast(conn: psycopg.Connection, horizon_days: int = 30) -> list[dict]:
         ORDER BY medicines.id, weeks.weeks_ago DESC
         """
     ).fetchall()
+    # How long each medicine has been tracked (first ledger movement).
+    first = {r["medicine_id"]: r["first_day"] for r in conn.execute(
+        """
+        SELECT batches.medicine_id, MIN(sm.movement_date)::date AS first_day
+        FROM stock_movements sm JOIN batches ON batches.id = sm.batch_id
+        GROUP BY batches.medicine_id
+        """
+    ).fetchall()}
 
     series: dict[int, list[int]] = {}
     for row in rows:
         series.setdefault(row["medicine_id"], []).append(row["units"])  # oldest -> newest
 
     stock = {s["medicine_id"]: s for s in inventory.medicine_stock(conn)}
+    today = date.today()
     results = []
     for medicine_id, weekly in series.items():
+        item = stock[medicine_id]
+        if not item["is_active"]:
+            continue
+        tracked_weeks = min(12, (today - first[medicine_id]).days // 7 + 1) if medicine_id in first else 0
+        observed = weekly[-tracked_weeks:] if tracked_weeks else []
         level = None
-        for units in weekly:
+        for units in observed:
             level = units if level is None else 0.5 * units + 0.5 * level
         weekly_rate = level or 0.0
-        demand = round(weekly_rate / 7 * horizon_days, 1)
-        active_weeks = sum(1 for w in weekly if w > 0)
-        item = stock[medicine_id]
+        daily_rate = weekly_rate / 7
+        demand = round(daily_rate * horizon_days, 1)
+        active_weeks = sum(1 for w in observed if w > 0)
+        mean = statistics.fmean(observed) if observed else 0
+        variability = round(statistics.pstdev(observed) / mean, 2) if observed and mean else None
+
+        if tracked_weeks < 4 or active_weeks < 3:
+            sufficiency = "INSUFFICIENT"
+        elif tracked_weeks < 8 or active_weeks < 6:
+            sufficiency = "LIMITED"
+        else:
+            sufficiency = "ADEQUATE"
+        # Confidence: how much history, then how regular it is.
+        irregular = variability is not None and variability > 1.5
+        if sufficiency == "INSUFFICIENT" or irregular:
+            confidence = "LOW"
+        elif sufficiency == "LIMITED" or (variability is not None and variability > 0.5):
+            confidence = "MEDIUM"
+        else:
+            confidence = "HIGH"
+
+        notes = []
+        if tracked_weeks < 12:
+            notes.append(f"Only {tracked_weeks} week(s) of history recorded.")
+        if active_weeks == 0:
+            notes.append("No dispensing recorded: forecast is zero, not a prediction of zero demand.")
+        if variability is not None and variability > 1.0:
+            notes.append("Weekly demand is highly irregular.")
+        if item["usable_stock"] == 0 and active_weeks:
+            notes.append("Currently out of stock: recent demand may be understated.")
+
+        stockout = (today + timedelta(days=math.floor(item["usable_stock"] / daily_rate))) if daily_rate > 0 else None
         results.append({
             "medicine_id": medicine_id,
             "medicine": item["medicine"],
@@ -305,8 +367,15 @@ def forecast(conn: psycopg.Connection, horizon_days: int = 30) -> list[dict]:
             "usable_stock": item["usable_stock"],
             "projected_stock_at_horizon": round(item["usable_stock"] - demand, 1),
             "covers_horizon": item["usable_stock"] >= demand,
-            "confidence": "LOW" if active_weeks < 4 else ("MEDIUM" if active_weeks < 8 else "HIGH"),
-            "method": "Exponential smoothing (alpha 0.5) of 12 weekly dispensing totals",
+            "projected_stockout_date": stockout,
+            "weeks_of_history": tracked_weeks,
+            "active_weeks": active_weeks,
+            "variability": variability,
+            "data_sufficiency": sufficiency,
+            "confidence": confidence,
+            "notes": notes,
+            "method": "Exponential smoothing (alpha 0.5) of up to 12 weekly dispensing totals",
+            "limitations": FORECAST_LIMITATIONS,
         })
     results.sort(key=lambda r: (r["covers_horizon"], -r["forecast_demand"]))
     return results
@@ -447,6 +516,45 @@ def dashboard(conn: psycopg.Connection) -> dict:
     from . import dispensing
     today_dispensing = dispensing.summary(conn, date.today())
 
+    recent_purchases = conn.execute(
+        """
+        SELECT po.id, po.order_number, po.order_date, po.status, suppliers.name AS supplier,
+               ROUND(COALESCE(SUM(poi.quantity_ordered * poi.unit_cost), 0), 2) AS order_value,
+               COUNT(poi.id) AS items
+        FROM purchase_orders po
+        JOIN suppliers ON suppliers.id = po.supplier_id
+        LEFT JOIN purchase_order_items poi ON poi.purchase_order_id = po.id
+        GROUP BY po.id, suppliers.name
+        ORDER BY po.order_date DESC, po.id DESC
+        LIMIT 5
+        """
+    ).fetchall()
+    supplier_activity = conn.execute(
+        """
+        SELECT pr.received_date, suppliers.name AS supplier, medicines.name AS medicine,
+               pr.quantity_received, po.order_number, po.id AS purchase_order_id
+        FROM purchase_receipts pr
+        JOIN purchase_order_items poi ON poi.id = pr.purchase_order_item_id
+        JOIN purchase_orders po ON po.id = poi.purchase_order_id
+        JOIN suppliers ON suppliers.id = po.supplier_id
+        JOIN medicines ON medicines.id = poi.medicine_id
+        ORDER BY pr.received_date DESC, pr.id DESC
+        LIMIT 6
+        """
+    ).fetchall()
+    open_transfers = conn.execute(
+        """
+        SELECT COUNT(*) FILTER (WHERE status = 'REQUESTED') AS awaiting_approval,
+               COUNT(*) FILTER (WHERE status = 'APPROVED') AS awaiting_dispatch,
+               COUNT(*) FILTER (WHERE status = 'DISPATCHED') AS in_transit
+        FROM transfers
+        """
+    ).fetchone()
+    held = conn.execute(
+        "SELECT COUNT(*) AS batches, COALESCE(SUM(quantity), 0)::int AS units FROM batches "
+        "WHERE batch_status <> 'ACTIVE' AND quantity > 0"
+    ).fetchone()
+
     return {
         "as_of": date.today(),
         "dispensing_today": {k: today_dispensing[k] for k in ("dispensations", "units", "sales_total", "prescriptions")},
@@ -477,4 +585,8 @@ def dashboard(conn: psycopg.Connection) -> dict:
         "slow_moving": [m for m in movement if m["movement_class"] != "ACTIVE" and m["usable_stock"] > 0][:6],
         "recent_movements": recent,
         "valuation_by_location": value["by_location"],
+        "recent_purchases": recent_purchases,
+        "supplier_activity": supplier_activity,
+        "open_transfers": open_transfers,
+        "held_batches": held,
     }
