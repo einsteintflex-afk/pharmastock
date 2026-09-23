@@ -1,16 +1,39 @@
-# PharmaStock
+# PharmaStock 2.0
 
-Pharmacy and healthcare inventory intelligence platform: a community-pharmacy
-dispensing counter (prescription and OTC, receipts, voids), medicines, batches,
-expiry engine, genuine FEFO dispensing, purchasing and receiving, stock
-ledger, low-stock and reorder intelligence, expiry-risk analytics, stock
-valuation, reports (CSV / Excel / PDF), audit trail, notifications, role-based
-access and an AI inventory assistant.
+![PharmaStock 2.0](frontend/assets/logo.webp)
 
-FastAPI + PostgreSQL backend, plain JavaScript (ES modules) frontend served at `/app`.
+Pharmacy and hospital inventory intelligence platform for community pharmacies, chains,
+hospitals and wholesalers: dispensing counter (prescription / OTC, receipts, voids),
+medicine master data with GS1 barcodes, batches with quarantine / recall, configurable
+expiry engine, genuine FEFO, stock ledger with reconciliation, purchasing and suppliers,
+transfers and ward requisitions with approval, explainable reorder, expiry-risk,
+stock-out and forecasting analytics, 22 reports (CSV / Excel / PDF, scheduled by e-mail),
+notifications (in-app, e-mail, SMS), append-only audit trail, six roles, multi-organization
+SaaS with database-enforced isolation and plans, an AI inventory assistant (decision
+support only), and a responsive installable web app.
 
-See **[docs/DELIVERY.md](docs/DELIVERY.md)** for the audit, architecture,
-database changes, API, test results and known limitations.
+FastAPI + PostgreSQL (row level security) backend; plain JavaScript (ES modules) frontend
+served at `/app`; Docker / HTTPS deployment.
+
+## Documentation
+
+| | |
+|---|---|
+| **[Delivery report](docs/DELIVERY.md)** | What was built, verified results, limitations |
+| [Architecture](docs/ARCHITECTURE.md) · [Database](docs/DATABASE.md) · [API](docs/API.md) | How it works |
+| [Deployment](docs/DEPLOYMENT.md) · [Migrations](docs/MIGRATIONS.md) · [Backup](docs/BACKUP.md) | Operating it |
+| [Security](docs/SECURITY.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) | Keeping it safe and running |
+| [Admin guide](docs/ADMIN_GUIDE.md) · [User guide](docs/USER_GUIDE.md) | Using it |
+| [Mobile](docs/MOBILE.md) · [Limitations & remaining work](docs/LIMITATIONS.md) | What is next |
+
+## Quick start with Docker
+
+```sh
+cp deploy/env.production.example .env.production   # fill in the change-me values
+docker compose --env-file .env.production up -d --build
+```
+
+Then open `https://<DOMAIN>/app/` (see [Deployment](docs/DEPLOYMENT.md)).
 
 ---
 
@@ -55,22 +78,26 @@ against a half-upgraded database.
 
 ```powershell
 python -m backend.manage create-admin          # interactive
+python -m backend.manage create-organization   # new tenant + first administrator
 python -m backend.manage reset-password        # interactive, any user
 python -m backend.manage reconcile             # batches vs stock ledger
 python -m backend.manage refresh-notifications
+python -m backend.manage process-deliveries    # scheduled reports + e-mail / SMS outbox now
 python -m backend.migrate status
 ```
 
 ## Backup and restore
 
 ```powershell
-# Backup (custom format, includes schema + data)
+# Backup as postgres (row level security: the application role cannot dump other organizations)
 pg_dump -U postgres -d pharmastock -F c -f backups\pharmastock-YYYYMMDD.dump
 
 # Restore into a NEW database (never over the live one without a backup)
 createdb -U postgres pharmastock_restore
 pg_restore -U postgres -d pharmastock_restore backups\pharmastock-YYYYMMDD.dump
 ```
+
+Scripts with checksums, retention and automatic verification: [docs/BACKUP.md](docs/BACKUP.md).
 
 Rolling back the upgrade = restore the pre-upgrade backup and check out the
 `local-import` branch.
@@ -83,8 +110,10 @@ the real database is never touched):
 
 ```powershell
 pip install -r requirements-dev.txt
-$env:TEST_DATABASE_URL="postgresql://postgres:PASSWORD@localhost:5432/pharmastock_test"
-pytest
+# A non-superuser role (a superuser bypasses row level security, so the tenancy tests would fail):
+psql -U postgres -c "CREATE ROLE pharmastock_test LOGIN PASSWORD 'test-pass' CREATEDB"
+$env:TEST_DATABASE_URL="postgresql://pharmastock_test:test-pass@localhost:5432/pharmastock_test"
+pytest          # 221 tests
 ```
 
 Browser end-to-end test (Node + Playwright, against a server running on a

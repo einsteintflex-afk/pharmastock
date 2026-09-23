@@ -1,6 +1,17 @@
-# PharmaStock 2.0 — Audit, Implementation and Delivery Report
+# PharmaStock 2.0 — Full Product Delivery Report
 
-Branch: `claude/bold-goldberg-p2dvu3` (based on `local-import`; nothing merged to `main`).
+Branch `claude/bold-goldberg-p2dvu3` (based on `local-import`; nothing merged into `main`, no pull request).
+All figures below were produced by running the code in this environment on 23 Sept 2026.
+
+**Result in one line:** the working 2.0 system was extended (not rebuilt) into a
+multi-organization, hospital-ready, mobile-ready platform with 12 migrations that keep
+every existing record, 116 permission-checked API endpoints, 221 passing backend tests
+and a 65-check browser test with 0 browser errors.
+
+Detailed guides: [Architecture](ARCHITECTURE.md) · [API](API.md) · [Database](DATABASE.md) ·
+[Migrations](MIGRATIONS.md) · [Deployment](DEPLOYMENT.md) · [Backup](BACKUP.md) ·
+[Security](SECURITY.md) · [Admin guide](ADMIN_GUIDE.md) · [User guide](USER_GUIDE.md) ·
+[Troubleshooting](TROUBLESHOOTING.md) · [Mobile](MOBILE.md) · [Limitations](LIMITATIONS.md)
 
 ---
 
@@ -33,191 +44,237 @@ syntax errors, no duplicate functions.
 
 ---
 
+The scope document was then audited against the 2.0 branch; everything missing is listed
+per section below as "added in this delivery".
+
+---
+
 ## 2. Architecture
 
-```
-frontend/            index.html, style.css (original design kept + additions)
-  js/core.js         escaping html`` templates, API client, tables, forms, toasts
-  js/app.js          ONE router (URL hash), navigation built from one route table,
-                     session state, permission-aware menu
-  js/pages/*.js      dashboard, dispensing counter, medicines, inventory, stock, purchasing, suppliers,
-                     analytics, reports, notifications, assistant, admin
-backend/
-  main.py            app assembly: middleware, security headers, error handlers,
-                     startup checks (pending migrations → refuse to start)
-  config.py          all configuration from environment (.env)
-  database.py        psycopg connection pool; one transaction per request
-  migrate.py         versioned SQL migrations (+ CLI)
-  security.py        scrypt passwords, hashed session tokens, require(permission)
-  permissions.py     roles → permissions (single source of truth)
-  audit.py           append-only audit trail, written in the same transaction
-  routers/           HTTP layer (one module per area)
-  services/          business logic shared by API, reports and AI assistant:
-                     expiry engine, inventory queries, stock ledger + FEFO, dispensing,
-                     analytics, notifications, reports, exporters, assistant
-  manage.py          admin CLI
-tests/               145 pytest tests + Playwright end-to-end script (49 checks)
-```
+FastAPI (stateless, uvicorn workers) + PostgreSQL 16+ with row level security; plain
+ES-module JavaScript web app served at `/app` (installable PWA); background loops for
+notification refresh, the e-mail/SMS outbox and scheduled reports (safe in every process:
+`FOR UPDATE SKIP LOCKED`); Caddy/nginx for HTTPS. Routers → services → database; the same
+service functions feed the API, reports, background jobs and the AI assistant, so every
+screen, export and AI answer shows identical numbers. See ARCHITECTURE.md.
 
-Design rules followed:
-- Every stock change goes through `services/stock.py`, locks the batch row,
-  and writes exactly one movement, so `batches.quantity` always equals the
-  ledger (verified by `GET /stock-reconciliation`).
-- Every figure (dashboard, reports, AI answers) comes from the same service
-  functions — no duplicated calculations, no data hard-coded in the frontend.
-- Permissions are checked on the server for every route; the frontend only
-  hides controls the user cannot use.
+## 3. Database
 
----
+24 tables, 65 foreign keys, CHECK constraints for every enumeration and quantity rule,
+per-organization unique keys, indexes for FEFO, ledger, audit and queues.
+**Row level security is enabled and forced on 19 business tables** (verified in
+`pg_class`); `users`, `sessions`, `password_reset_tokens` (needed before sign-in) filter by
+organization explicitly. See DATABASE.md.
 
-## 3. Database changes (migrations — existing data preserved)
+## 4. Migrations and data preservation
 
-`python -m backend.migrate` applies versioned SQL files in
-`backend/migrations/`, each in its own transaction, recorded with a checksum in
-`schema_migrations`. Each migration checks existing data first and **stops
-with a clear message** instead of altering rows it cannot safely convert.
+12 versioned migrations with checksums; the server refuses to start while any is pending.
+Added in this delivery: 0008 tenancy, 0009 master data / holds, 0010 transfers,
+0011 outbox / schedules, 0012 password reset / devices.
 
-| Migration | Change | Why it was necessary |
-|-----------|--------|----------------------|
-| 0001_baseline | The original 7 tables. **Stamped, not run**, on an existing database | Fresh installs; history starts from the real schema |
-| 0002_integrity_constraints | CHECK constraints (non-negative reorder level/quantity, non-blank names, valid movement types), unique medicine identity (name+strength+form, case-insensitive), unique supplier name, FK indexes | API previously accepted invalid data; FK columns were unindexed |
-| 0003_locations_and_batch_details | `locations` table (type: PHARMACY/STORE/COLD_CHAIN/WARD/BRANCH/DEPARTMENT, optional parent); `batches.location_id` (all existing → "Main Pharmacy"), `unit_cost`, `supplier_id`, `received_date`, `created_at`; unique (medicine, batch number, location) | Valuation needs a cost per batch; batches entered outside a PO have no other place for it. Cost/supplier/date **backfilled from purchase receipts where traceable** (AMOX002 → ₵5.50, MedSupply); others left unknown — never guessed |
-| 0004_users_sessions_audit | `users` (role CHECK), `sessions` (token SHA-256 only), `audit_log` + trigger making it **append-only** | Authentication, authorization, auditability |
-| 0005_stock_ledger | `stock_movements.user_id`; ADJUSTMENT now stores the signed change; **one labelled "Opening balance" ADJUSTMENT per unreconciled batch** (dated before its first movement); sign CHECK | Makes the ledger reconcile for every existing batch. No batch quantity changed |
-| 0006_notifications_settings_purchasing | `app_settings` (expiry thresholds 30/90/180 days, slow-moving, lead time, cover days, currency ₵), `notifications`, `notification_reads`, `purchase_orders.created_by`, `purchase_receipts.received_by_user_id` | Configurable thresholds; notification centre; purchasing accountability |
-| 0007_dispensing | `dispensations` (one per customer/prescription: type OTC/PRESCRIPTION, optional patient name/phone, prescriber, Rx number, payment method, total, status, void details), `dispensation_items` (medicine, quantity, unit price, directions), `stock_movements.dispensation_item_id`, `medicines.selling_price`, receipt header settings | No existing table records a customer transaction, prescription, price or payment. Linking movements to lines gives batch → patient traceability (recalls) and exact-batch voids |
+Verified on the original dumps (`db_schema.sql` + `db_testdata.sql`) → all 12 migrations:
 
-Not added (existing relationships already suffice): roles/permissions tables
-(fixed role set in code), separate inventory table (derived from batches),
-a batch-supplier link table (supplier derivable from receipts; stored on the
-batch only because non-PO batches need it), transfers (see limitations).
+| Table | Before | After |
+|---|---|---|
+| medicines | 3 | 3 |
+| batches | 6 | 6 |
+| suppliers | 1 | 1 |
+| purchase_orders / items / receipts | 1 / 1 / 1 | 1 / 1 / 1 |
+| stock_movements | 2 | 7 (+5 opening-balance movements from 0005) |
+| total units in stock | 470 | 470 |
+| batches not matching the ledger | — | **0** |
 
-Verified on the real dump: 3 medicines, 6 batches, 1 supplier, 1 PO, 1 receipt
-and both original movements unchanged; ledger reconciled for all 6 batches;
-re-running migrations is a no-op; a fresh empty database builds the full
-schema; editing an applied migration is detected.
+No table was dropped or recreated; existing rows were assigned to organization 1
+(Enterprise plan).
 
----
+## 5. Backend
 
-## 4. API
-
-Original endpoints keep their paths, request bodies and response fields
-(new fields are additions). **All endpoints except `/`, `/health`,
-`/auth/login` and `/app` now require sign-in.**
-
-Behaviour changes to original endpoints (all deliberate fixes):
-- `/stock-alerts`: adds `medicine_id`; `current_stock` is **usable** (non-expired) stock; status adds `OUT OF STOCK`.
-- `/inventory`: statuses now EXPIRED / **CRITICAL** (≤30 d) / URGENT (≤90 d) / APPROACHING EXPIRY (≤180 d) / NORMAL, thresholds configurable (previously URGENT ≤30, APPROACHING ≤90, hard-coded).
-- `POST /stock-movements`: permission per movement type; DISPENSED refuses expired batches and enforces FEFO (409 with the FEFO batch, or `fefo_override_reason` with permission); EXPIRED only for expired batches; ADJUSTMENT/DAMAGED need a reason; counted quantity 0 allowed.
-- `POST /batches`: records the initial quantity as a RECEIVED movement; duplicate batch at the same location → 409.
-- `POST /purchase-receipts`: rejects already-expired stock; records cost, supplier, location, user; weighted average cost when adding to an existing batch.
-- Validation errors → 422 with field messages; database constraint errors → 400/409; unexpected errors → 500 with a request id only.
-
-| Area | Routes |
-|------|--------|
-| Auth | `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, `POST /auth/change-password` |
-| Users | `GET/POST /users`, `PUT /users/{id}`, `POST /users/{id}/reset-password`, `GET /roles` |
-| Medicines | `GET/POST /medicines` (search, sort), `GET/PUT /medicines/{id}` (detail: stock, FEFO order, batches, movements, purchases, risk) |
-| Inventory | `GET /inventory` (search/status/location/supplier filters), `GET /expiry-alerts`, `GET /stock-alerts`, `POST /batches`, `GET/PUT /batches/{id}` (history with running balance), `GET /stock-reconciliation` |
-| FEFO | `GET /fefo/{medicine_id}?quantity=` (plan), `POST /dispense` (single medicine, allocates across batches) |
-| Dispensing counter | `POST /dispensations` (multi-medicine, all-or-nothing, FEFO per line), `GET /dispensations` (date/status/search), `GET /dispensations/summary` (day totals by payment method), `GET /dispensations/{id}`, `POST /dispensations/{id}/void` (returns stock to the same batches) |
-| Movements | `GET/POST /stock-movements` (filters), `GET /stock-movements/types` |
-| Suppliers | `GET/POST /suppliers`, `GET/PUT /suppliers/{id}`, `POST /suppliers/{id}/activate`, `/deactivate` |
-| Purchasing | `GET/POST /purchase-orders`, `GET /purchase-orders/next-number`, `GET/PUT /purchase-orders/{id}`, `POST /purchase-orders/{id}/cancel`, `GET/POST /purchase-orders/{id}/items`, `PUT/DELETE /purchase-orders/{id}/items/{item_id}`, `GET/POST /purchase-receipts` |
-| Analytics | `GET /dashboard`, `/consumption`, `/slow-moving-products`, `/analytics/{consumption,reorder,expiry-risk,valuation,forecast,turnover,purchasing}` |
-| Reports | `GET /reports`, `GET /reports/{key}?format=json|csv|xlsx|pdf` — inventory, expiry, expired, low-stock, stock-movements, purchases, suppliers, valuation, expiry-loss, consumption, expiry-risk |
-| Notifications | `GET /notifications`, `/notifications/unread-count`, `POST /notifications/{id}/read`, `/read-all`, `/refresh` |
-| Admin | `GET /audit-log`, `GET/PUT /settings`, `GET/POST /locations`, `PUT /locations/{id}`, `GET /system/migrations` |
-| AI | `GET /assistant/status`, `POST /assistant/ask` |
-| System | `GET /`, `GET /health`, `/app` |
-
-### Roles
-
-| Permission | Viewer | Storekeeper | Technician | Pharmacist | Manager | Admin |
-|---|---|---|---|---|---|---|
-| View inventory, analytics, notifications, AI assistant | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Export reports | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Register batches / receive outside PO | | ✓ | | ✓ | ✓ | ✓ |
-| Returns, damage, expiry write-off, stock-count adjustment | | ✓ | | ✓ | ✓ | ✓ |
-| Receive purchase deliveries | | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Dispense (FEFO) | | | ✓ | ✓ | ✓ | ✓ |
-| Override FEFO (with reason) | | | | ✓ | ✓ | ✓ |
-| Void a dispensation | | | | ✓ | ✓ | ✓ |
-| Edit medicines, suppliers; create/cancel POs | | | | ✓ | ✓ | ✓ |
-| Locations, settings, audit trail | | | | | ✓ | ✓ |
-| Users | | | | | | ✓ |
-
----
-
-## 5. Intelligence — how figures are computed
-
-- **Expiry status**: `days = expiry_date − today`; thresholds from Settings. A batch is usable on its expiry date.
-- **FEFO**: usable batches (quantity > 0, not expired) ordered by expiry date, then id; dispensing locks them (`SELECT … FOR UPDATE`) and allocates earliest first, splitting across batches. Insufficient stock → nothing changes.
-- **Consumption**: DISPENSED units; daily rate = last 30 days ÷ 30 (or 90-day ÷ 90 if none recently); trend = last 30 vs previous 30 days (±20%).
-- **Reorder**: recommended when usable ≤ reorder level or days of stock ≤ lead time; quantity = max(reorder level, daily × (lead + cover days)) − usable − on order.
-- **Expiry risk**: each medicine's batches consumed in FEFO order at the daily rate; units left at a batch's expiry are "at risk", valued at batch cost. HIGH = at risk within the urgent window, or ≥ 50 % at risk within the approaching window; MEDIUM = at risk further out (dead-stock risk).
-- **Valuation**: quantity × batch unit cost; units without a recorded cost are counted and reported, never valued at a guessed price.
-- **Forecast**: exponential smoothing (α 0.5) of 12 weekly dispensing totals; confidence from weeks with activity.
-- **Turnover**: 90-day dispensed ÷ average of current and 90-days-ago stock (reconstructed from the ledger).
-- **AI assistant**: with `ANTHROPIC_API_KEY`, Claude answers using 11 read-only tools over these same functions (tool results are treated as data, not instructions); without a key, a built-in engine routes the question to the same tools. Every query is audited.
-
----
+116 API endpoints (catalogue generated from the code: API.md); only sign-in, forgot
+password and reset password are public. Versioned alias `/api/v1`, `limit`/`offset` +
+`X-Total-Count`, structured JSON errors, request ids. New services in this delivery:
+`trends`, `transfers`, `barcode`, `delivery`, `scheduler`, `organizations`, `plans`.
 
 ## 6. Frontend
 
-One application shell (`js/app.js`) with a single route table driving both
-the router and the sidebar; URL hash routes (bookmarkable, Back button works);
-each page renders into a fresh element so no event handlers leak between pages.
-All text is inserted through an escaping template function; no inline
-JavaScript (enforced by a Content-Security-Policy of `script-src 'self'`).
-The original visual design and CSS were kept and extended.
+PharmaStock 2.0 logo on sign-in, brand mark and generated icons; collapsible sidebar,
+phone/tablet drawer, tables scroll inside cards, toasts sized for phones (65-check E2E
+includes "no horizontal page scroll" at 390 px on four pages). New pages: barcode scan,
+transfers / requisitions (list, create, detail with approve / reject / cancel / dispatch /
+receive), stock reconciliation, organization & plan, platform administration, e-mail /
+SMS outbox and scheduled reports, forgot / reset password; extended: medicines (master
+data, active filter, barcode search), batches (hold actions), counter and receiving (scan),
+suppliers (receipts, activity), analytics (trends with SVG charts, locations, stock-outs,
+suppliers, forecast sufficiency), dashboard (purchases, supplier activity, transfers,
+held stock), account (notification preferences, devices), users (location, reset links,
+devices), audit and movements (server paging). Screenshots: `docs/screenshots/`.
+No duplicate functions, no syntax errors, every import resolves (checked by script, also in CI).
 
-Pages: Sign-in, Dashboard, Medicines (+ detail), Inventory (+ batch detail),
-Expiry Alerts (write-off), **Dispensing Counter** (search → cart with live FEFO
-batches per line → prescription/OTC details → payment → printable receipt),
-Dispensing History (+ record, reprint, void), Stock Movements,
-Purchasing (+ order detail, receiving), Suppliers (+ detail), Analytics (7 tabs),
-Reports (run + CSV/Excel/PDF), AI Assistant, Notifications, Audit Trail,
-Users (+ role matrix), Settings (+ locations), My Account.
+## 7. Security
 
-The old `frontend/app.js` and backup files were moved to `archive/` (not served).
+scrypt passwords, hashed session and reset tokens, lockout, per-IP and per-session rate
+limits, CSRF header + origin check, SameSite=Strict/HttpOnly/Secure cookies, strict CSP (no
+inline script/style), full security headers, HSTS, forced RLS tenant isolation with a
+production check that refuses superuser/BYPASSRLS database roles, append-only audit,
+CSV-injection guard, no secrets in code or image. Details and checklist: SECURITY.md.
 
----
+## 8. Users, roles and authentication
 
-## 7. Test results (this branch)
+Six roles (Administrator, Manager, Pharmacist, Pharmacy Technician, Storekeeper, Viewer)
+mapped to 22 permissions, enforced on the API (23 permission tests). Sign-in / sign-out,
+password change, forced change of temporary passwords, lockout, self-service reset by
+e-mail (no account enumeration), administrator reset links, named devices with remote
+sign-out, session invalidation on password change / reset / deactivation / suspension,
+location-scoped staff, platform administrators.
 
-| Check | Result |
-|---|---|
-| Python compile of all backend modules | pass |
-| JavaScript syntax check of all 13 modules; duplicate-function scan | pass; none |
-| Backend startup (migrations check, bootstrap admin, pool, notification job) | clean |
-| `pytest` — 145 tests (incl. 11 for the dispensing counter: multi-line FEFO, all-or-nothing, prices/totals, prescription rules, expired stock never dispensed, permissions, void to same batches, summary, report): migrations & data preservation, auth, lockout, sessions, permissions matrix, legacy API regression, expiry engine, FEFO, ledger reconciliation, movements, purchasing (partial/full/cancel/validation), analytics numbers checked against hand calculations, all 11 reports × 4 formats, CSV-injection, audit append-only, notifications, locations, assistant (built-in + mocked Claude tool loop), error handling, security headers | **145 passed** |
-| Playwright end-to-end (Chromium) — 49 checks (incl. a two-medicine prescription at the counter with FEFO, directions, NHIS payment and receipt; history search; stock deduction; void with stock returned and ledger reconciled): sign-in, forced password change, every page, navigation, search, sort, add/edit/validate medicine, FEFO dispensing, write-off, supplier, PO create → receive, analytics, report exports, assistant, notifications, audit, settings validation, user creation, sign-out, viewer restrictions (UI and API), mobile layout | **49/49 passed, 0 browser console/page errors** |
+## 9. Inventory, expiry and FEFO
 
-Tests ran on PostgreSQL 16 in a cloud container using your dumps; your server
-is PostgreSQL 18 (the SQL used is compatible; the test loader strips the
-PG18-only `\restrict` lines).
+- Medicine master: name, strength, form, generic, brand, route, manufacturer, GTIN
+  (check digit validated, unique per organization), active flag (inactive = cannot be
+  ordered or stocked), reorder level, price.
+- Batches: status (ACTIVE / QUARANTINED / RECALLED; releasing a recall needs a manager),
+  purchase and received dates, supplier, cost, scanned barcode, running-balance history.
+- Configurable expiry engine (critical / urgent / approaching days) driving statuses,
+  alerts, notifications, reports and risk.
+- FEFO: usable = ACTIVE and not expired; earliest expiry first with row locks; overrides
+  need a permission and a reason; used by the counter, quick dispense, transfers and AI.
+- Movements: RECEIVED, DISPENSED, RETURNED, DAMAGED, EXPIRED, ADJUSTMENT (signed),
+  TRANSFER_OUT, TRANSFER_IN — each audited; reconciliation report plus resolve action
+  (trust ledger / trust count with an ADJUSTMENT), audited.
 
----
+## 10. Purchasing and suppliers
 
-## 8. Known limitations
+Purchase orders (draft → ordered → partially received → received / cancelled), lines,
+partial receipts that create or top up batches with weighted cost, purchase date and
+scanned barcode, notifications. Suppliers: activation, purchase history, products,
+**receipt history and activity trail**, performance analytics (spend share, fill rate,
+lead time, price changes, last order / delivery).
 
-- **Not yet run on your Windows machine / PostgreSQL 18.** Back up first, run `python -m backend.migrate status`, then migrate.
-- The AI assistant's Claude path was verified with a mocked client (no API key in this environment); the built-in engine was tested against real data.
-- Stock **transfers between locations** are not implemented (the schema supports them: batches are per location). Dispensing can be limited to a location.
-- Forecasting is statistical (exponential smoothing), deliberately simple given the small history; confidence is reported.
-- Notifications are in-app only (no email/SMS). The background refresh runs inside the web process (every 15 min) — with several server processes each runs it (harmless, idempotent).
-- Login throttling is per account (lockout); there is no per-IP rate limit — add one at the reverse proxy for internet exposure.
-- HTTPS must be provided by the deployment (reverse proxy); set `PHARMASTOCK_ENV=production` there.
-- Existing batches (except AMOX002) have no recorded unit cost, so their value shows as "units without cost" until entered (Batch → Edit details).
-- Dates use the database server's local date (`CURRENT_DATE`).
+## 11. Analytics and forecasting
 
-## 9. Remaining work (suggested order)
+Reorder recommendations with the calculation and projected stock-out date; expiry risk;
+consumption and trends; **monthly stock trend** (in / out / write-offs / closing stock
+reconstructed from the ledger); **expiry trend** (write-offs by month and 12-month expiry
+calendar); **stock-out history** (days and episodes without usable stock, reconstructed per
+batch); **location analytics**; supplier performance; purchasing trends; turnover;
+valuation. Forecasts report weeks of history, active weeks, variability, **data
+sufficiency** (INSUFFICIENT / LIMITED / ADEQUATE), confidence, notes and explicit
+limitations. 22 reports in JSON / CSV / Excel / PDF (all four formats tested for every
+report); report views and exports are audited; the audit report needs `audit.read`.
 
-1. Run the upgrade on the Windows installation (backup → migrate → smoke test) and enter unit costs for existing batches.
-2. Stock transfers between locations (TRANSFER_OUT/IN movements) and requisitions for hospital use.
-3. Email/SMS notification delivery; scheduled report emails.
-4. Deployment: reverse proxy with HTTPS, automated daily `pg_dump`, CI running pytest + the Playwright script.
-5. Barcode scanning (GS1 DataMatrix: product, batch, expiry) for receiving and dispensing.
-6. Multi-organisation (tenant) support if offered as SaaS; per-location permissions.
-7. Mobile app using the same API (Bearer tokens are already supported).
+## 12. AI assistant
+
+19 read-only tools over the same services (new: monthly summary, stock changes, top
+suppliers, overstock, expired stock, stock-outs, locations, open transfers; forecast now
+includes sufficiency). Claude (tool loop with server-side fallback) when a key is set;
+otherwise a deterministic engine that answers the same questions from the same data.
+Every question is audited. The system prompt forbids inventing figures, treats tool
+output as data, and states it is inventory decision support, not clinical advice.
+Tested questions include "summary of this month", "how has stock changed this month",
+"top suppliers", "high stock but low consumption", "value of expired stock", "stock-outs".
+
+## 13. Notifications and delivery
+
+In-app notifications (expiry, low stock, purchasing, receiving, transfers — actionable ones
+stay open until handled). E-mail and SMS: per-user opt-in and minimum severity, outbox in
+the same transaction, background sending with exponential back-off, SKIPPED with reason
+when a channel is not configured, admin list / test / retry. Scheduled reports: daily /
+weekly / monthly, PDF / Excel / CSV attachments, rolling periods. Verified against a real
+local SMTP server (attachment checked) and an HTTP SMS gateway.
+
+## 14. Barcode
+
+GS1 parser: GTIN-8/12/13/14 with check digits, DataMatrix / GS1-128 element strings with
+the GS separator (and `<GS>`, `^]`, symbology prefixes), human-readable `(01)…(17)…(10)…`,
+AIs 01, 02, 10, 11, 13, 15, 17, 20, 21, 30, 240, 241; day 00 = end of month; codes
+without batch / expiry are accepted. Lookup returns the medicine, matching batch, FEFO
+batch, open order lines and warnings (expired pack, expiry mismatch, held batch, FEFO).
+Used on the scan page, the dispensing counter, batch registration and purchase receiving.
+
+## 15. Mobile readiness
+
+Responsive installable PWA (manifest, icons, shell-only service worker), camera scanning
+where supported, `/api/v1`, bearer tokens with device names and remote revocation,
+pagination headers, compact scan endpoint. Native app architecture and the server work it
+needs: MOBILE.md.
+
+## 16. Hospital readiness
+
+Organization types (community pharmacy, chain, hospital, wholesale); hospitals start with a
+Central Store; location types central store / store / cold chain / ward / department /
+branch in a hierarchy; **requisitions** from wards with approval (quantities can be reduced,
+optional separate approver), FEFO dispatch, receipt into ward batches with the same number
+and expiry, full traceability source batch → destination batch; staff assigned to a ward
+are limited to it; hospitals see "Requisitions" in the menu.
+
+## 17. Multi-organization / SaaS readiness
+
+Organizations with status (trial, active, suspended, cancelled) and plan (Basic,
+Professional, Enterprise) defining limits (users, locations) and features
+(multi-location, advanced analytics, AI assistant, scheduled reports, hospital, API
+access) — **no prices in code**; per-organization overrides; billing customer reference
+field; platform administration UI and CLI; suspension blocks sign-in and revokes sessions.
+Isolation proven by tests: a second organization sees none of organization 1's medicines,
+batches, users, audit entries or notifications; org 1 IDs return 404; raw SQL under org 2's
+context sees 0 org-1 rows and cannot insert into org 1; with no context nothing is visible.
+
+## 18. Deployment and operations
+
+Dockerfile (non-root, health check, no OS packages), docker-compose (PostgreSQL with
+application and backup roles, app, Caddy automatic HTTPS, scheduled backups), staging and
+production env templates, nginx alternative with rate limits, GitHub Actions CI.
+Observability: `/health`, `/ready` (migration status), `/metrics` (Prometheus, token),
+JSON logs with request ids, error webhook / Sentry hook.
+**Verified here**: the compose stack started in production mode as a non-superuser role;
+HTTP redirected to HTTPS; HSTS, CSP and Secure cookie present; `/docs` 404; metrics 401
+without token; sign-in worked; the backup service produced a dump that
+`verify_backup.sh` restored (12 migrations, row counts, ledger reconciled). Backup as the
+application role fails by design (RLS) — documented. Restore refuses to overwrite a
+database and refuses a corrupted file (checksum).
+
+## 19. Testing (actual results)
+
+**Backend — `pytest`: 221 passed, 0 failed (14.0 s)** against a real PostgreSQL database
+built from the original dumps + all migrations, as a non-superuser role (RLS enforced):
+
+| File | Tests | Covers |
+|---|---|---|
+| test_analytics_reports | 33 | consumption, reorder, risk, valuation, forecast, dashboard, every report × 4 formats |
+| test_permissions | 23 | role matrix on the API |
+| test_assistant | 22 | tools, built-in answers (14 sample questions), Claude loop (mocked), fallback, audit |
+| test_inventory_fefo | 17 | expiry statuses, FEFO, overrides, movements, ledger |
+| test_master_data | 12 | GS1 parsing, GTIN, master fields, holds, reconciliation actions, pagination, supplier receipts, barcode lookup |
+| test_auth, test_legacy_api, test_purchasing, test_hardening, test_trends | 11 each | sign-in / lockout; original API contract; purchasing; rate limit, CSRF, origin, /api/v1, ready, metrics, logs, error hook, devices, password reset; trends, stock-outs, locations, suppliers, forecast sufficiency, AI tools |
+| test_delivery | 10 | preferences, queueing by severity, retry / fail, skip, scheduled reports, real SMTP, SMS webhook |
+| test_dispensing | 10 | counter, prescriptions, receipts, voids |
+| test_audit_notifications | 9 | append-only audit, notifications |
+| test_tenancy | 8 | isolation (API, SQL, cross-tenant ids), plan limits and features, platform admin, suspension |
+| test_transfers | 8 | full requisition lifecycle, FEFO dispatch, merge, insufficient stock, reject / cancel, validation, location scoping, separate approver, listing |
+| test_errors_security | 8 | error handling, headers, tokens |
+| test_migrations | 6 | upgrade path and data preservation |
+
+**Browser — Playwright end-to-end: 65/65 checks passed, 0 browser (console / page) errors**
+on a fresh copy of the original data: sign-in and forced password change, all 21 pages,
+navigation, search / sort, medicine CRUD with validation, dispensing with FEFO and receipt,
+void, purchasing and partial receipt, write-off, analytics (11 tabs incl. charts),
+reports in 3 formats, AI assistant, notifications, audit, settings, users, GTIN + GS1
+scan, scan at the counter, quarantine / release, a full ward requisition, reconciliation,
+account preferences and devices, sidebar collapse, service worker, viewer restrictions,
+CSRF refusal, mobile drawer and no horizontal scroll, forgot password.
+
+**Static checks**: `compileall` clean; `node --check` on every JS module; no duplicate
+function declarations; every named import resolves.
+
+## 20. Known limitations
+
+See LIMITATIONS.md — notably: tested on PostgreSQL 16 / Linux (not yet on your PG18 /
+Windows machine), Claude path tested with a mock, no provider-specific SMS adapter,
+transfers received all-or-nothing, no billing-provider integration, CI not yet run on
+GitHub, camera scanning depends on browser support.
+
+## 21. Remaining work
+
+1. Upgrade a copy of the production database (PG18, Windows), then production — with backup.
+2. Enable GitHub Actions; configure SMTP and an SMS gateway adapter.
+3. Partial transfer receipts with discrepancy reasons.
+4. Push notifications + refresh tokens → native mobile app.
+5. Billing provider integration; seasonality-aware forecasting; hospital clinical modules if required.
