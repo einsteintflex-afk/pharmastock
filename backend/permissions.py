@@ -34,6 +34,7 @@ PERMISSIONS = {
     "batches.write": "Create batches / opening stock and edit batch details",
     "stock.dispense": "Dispense stock (FEFO)",
     "stock.fefo_override": "Dispense from a batch other than the FEFO batch, with a reason",
+    "dispensing.void": "Void a completed dispensation (stock is returned to its batches)",
     "stock.adjust": "Record returns, damage, expiry write-offs and stock-count adjustments",
     "purchasing.write": "Create, edit and cancel purchase orders",
     "purchasing.receive": "Receive purchase order deliveries",
@@ -55,12 +56,12 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
     },
     "PHARMACIST": _READ | {
         "reports.export", "medicines.write", "suppliers.write", "batches.write",
-        "stock.dispense", "stock.fefo_override", "stock.adjust",
+        "stock.dispense", "stock.fefo_override", "stock.adjust", "dispensing.void",
         "purchasing.write", "purchasing.receive",
     },
     "MANAGER": _READ | {
         "reports.export", "medicines.write", "suppliers.write", "batches.write",
-        "stock.dispense", "stock.fefo_override", "stock.adjust",
+        "stock.dispense", "stock.fefo_override", "stock.adjust", "dispensing.void",
         "purchasing.write", "purchasing.receive",
         "locations.manage", "settings.manage", "audit.read",
     },

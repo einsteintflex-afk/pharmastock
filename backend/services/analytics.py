@@ -445,8 +445,12 @@ def dashboard(conn: psycopg.Connection) -> dict:
         """
     ).fetchall()
 
+    from . import dispensing
+    today_dispensing = dispensing.summary(conn, date.today())
+
     return {
         "as_of": date.today(),
+        "dispensing_today": {k: today_dispensing[k] for k in ("dispensations", "units", "sales_total", "prescriptions")},
         "thresholds": thresholds.as_params(),
         "total_medicines": len(stock),
         "medicines_in_stock": sum(1 for s in stock if s["usable_stock"] > 0),

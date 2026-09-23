@@ -41,6 +41,16 @@ export async function render(ctx) {
             ${statTile("Slow-moving", plural(data.slow_moving_count, "medicine"), "blue", "little or no dispensing in 90 days", "🐢")}
         </section>
 
+        <section class="section today-strip">
+            <div><h3>Dispensing today</h3>
+                <p>${plural(data.dispensing_today.dispensations, "transaction")} · ${plural(data.dispensing_today.prescriptions, "prescription")} ·
+                ${number(data.dispensing_today.units)} units · ${money(data.dispensing_today.sales_total)} sales</p></div>
+            <div class="top-actions">
+                <a class="view-btn" href="#/dispensations">History</a>
+                ${ctx.can("stock.dispense") ? html`<a class="refresh-btn primary" href="#/dispense">Open dispensing counter</a>` : ""}
+            </div>
+        </section>
+
         <section class="section">
             <div class="section-header">
                 <div><h3>Expiry Alerts</h3><p>Batches in stock approaching expiry (FEFO order)</p></div>

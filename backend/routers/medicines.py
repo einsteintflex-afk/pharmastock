@@ -26,6 +26,7 @@ class Medicine(BaseModel):
     strength: str | None
     dosage_form: str | None
     reorder_level: int
+    selling_price: float | None = None
 
 
 class MedicineCreate(BaseModel):
@@ -33,6 +34,8 @@ class MedicineCreate(BaseModel):
     strength: Short50 | None = None
     dosage_form: Short50 | None = None
     reorder_level: int = Field(default=20, ge=0, le=10_000_000)
+    # Optional. On update, omitting it keeps the current price.
+    selling_price: float | None = Field(default=None, ge=0, le=1_000_000)
 
 
 def _clean(body: MedicineCreate) -> tuple:
@@ -68,7 +71,7 @@ def get_medicines(
     order = {"id": "id", "name": "lower(name), id", "reorder_level": "reorder_level, lower(name)"}[sort]
     return conn.execute(
         f"""
-        SELECT id, name, strength, dosage_form, reorder_level
+        SELECT id, name, strength, dosage_form, reorder_level, selling_price
         FROM medicines
         WHERE (%(search)s::text IS NULL
                OR name ILIKE %(pattern)s OR strength ILIKE %(pattern)s OR dosage_form ILIKE %(pattern)s)
@@ -84,11 +87,11 @@ def create_medicine(body: MedicineCreate, user: CurrentUser = Depends(require("m
     _duplicate_check(conn, body)
     row = conn.execute(
         """
-        INSERT INTO medicines (name, strength, dosage_form, reorder_level)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id, name, strength, dosage_form, reorder_level
+        INSERT INTO medicines (name, strength, dosage_form, reorder_level, selling_price)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id, name, strength, dosage_form, reorder_level, selling_price
         """,
-        _clean(body),
+        (*_clean(body), body.selling_price),
     ).fetchone()
     audit.record(conn, user, "CREATE", "medicine", row["id"], None, dict(row))
     conn.commit()
@@ -100,7 +103,7 @@ def update_medicine(medicine_id: int, body: MedicineCreate,
                     user: CurrentUser = Depends(require("medicines.write")),
                     conn: psycopg.Connection = Depends(get_db)):
     old = conn.execute(
-        "SELECT id, name, strength, dosage_form, reorder_level FROM medicines WHERE id = %s FOR UPDATE",
+        "SELECT id, name, strength, dosage_form, reorder_level, selling_price FROM medicines WHERE id = %s FOR UPDATE",
         (medicine_id,),
     ).fetchone()
     if old is None:
@@ -108,13 +111,14 @@ def update_medicine(medicine_id: int, body: MedicineCreate,
 
     _duplicate_check(conn, body, exclude_id=medicine_id)
 
+    price = body.selling_price if "selling_price" in body.model_fields_set else old["selling_price"]
     row = conn.execute(
         """
-        UPDATE medicines SET name = %s, strength = %s, dosage_form = %s, reorder_level = %s
+        UPDATE medicines SET name = %s, strength = %s, dosage_form = %s, reorder_level = %s, selling_price = %s
         WHERE id = %s
-        RETURNING id, name, strength, dosage_form, reorder_level
+        RETURNING id, name, strength, dosage_form, reorder_level, selling_price
         """,
-        (*_clean(body), medicine_id),
+        (*_clean(body), price, medicine_id),
     ).fetchone()
     before, after = audit.changed_fields(dict(old), dict(row))
     if after:

@@ -132,6 +132,7 @@ def medicine_stock(
                 medicines.strength,
                 medicines.dosage_form,
                 medicines.reorder_level,
+                medicines.selling_price,
                 COALESCE(SUM(batches.quantity) FILTER (WHERE batches.expiry_date >= CURRENT_DATE), 0)::int
                     AS usable_stock,
                 COALESCE(SUM(batches.quantity) FILTER (WHERE batches.expiry_date < CURRENT_DATE), 0)::int

@@ -11,6 +11,7 @@ import * as dashboard from "./pages/dashboard.js";
 import * as medicines from "./pages/medicines.js";
 import * as inventory from "./pages/inventory.js";
 import * as stock from "./pages/stock.js";
+import * as dispensing from "./pages/dispensing.js";
 import * as purchasing from "./pages/purchasing.js";
 import * as suppliers from "./pages/suppliers.js";
 import * as analytics from "./pages/analytics.js";
@@ -28,7 +29,9 @@ const ROUTES = [
     { path: "inventory", label: "Inventory", icon: "📦", permission: "inventory.read", page: inventory.renderInventory },
     { path: "batches/:id", parent: "inventory", permission: "inventory.read", page: inventory.renderBatch },
     { path: "expiry", label: "Expiry Alerts", icon: "⚠", permission: "inventory.read", page: inventory.renderExpiry },
-    { path: "dispense", label: "Dispense (FEFO)", icon: "➜", permission: "stock.dispense", page: stock.renderDispense },
+    { path: "dispense", label: "Dispensing Counter", icon: "➜", permission: "stock.dispense", page: dispensing.renderCounter },
+    { path: "dispensations", label: "Dispensing History", icon: "🧾", permission: "inventory.read", page: dispensing.renderHistory },
+    { path: "dispensations/:id", parent: "dispensations", permission: "inventory.read", page: dispensing.renderDetail },
     { path: "movements", label: "Stock Movements", icon: "↔", permission: "inventory.read", page: stock.renderMovements },
     { path: "purchasing", label: "Purchasing", icon: "🛒", permission: "inventory.read", page: purchasing.renderList },
     { path: "purchasing/:id", parent: "purchasing", permission: "inventory.read", page: purchasing.renderDetail },

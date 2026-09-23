@@ -40,7 +40,7 @@ frontend/            index.html, style.css (original design kept + additions)
   js/core.js         escaping html`` templates, API client, tables, forms, toasts
   js/app.js          ONE router (URL hash), navigation built from one route table,
                      session state, permission-aware menu
-  js/pages/*.js      dashboard, medicines, inventory, stock, purchasing, suppliers,
+  js/pages/*.js      dashboard, dispensing counter, medicines, inventory, stock, purchasing, suppliers,
                      analytics, reports, notifications, assistant, admin
 backend/
   main.py            app assembly: middleware, security headers, error handlers,
@@ -53,10 +53,10 @@ backend/
   audit.py           append-only audit trail, written in the same transaction
   routers/           HTTP layer (one module per area)
   services/          business logic shared by API, reports and AI assistant:
-                     expiry engine, inventory queries, stock ledger + FEFO,
+                     expiry engine, inventory queries, stock ledger + FEFO, dispensing,
                      analytics, notifications, reports, exporters, assistant
   manage.py          admin CLI
-tests/               134 pytest tests + Playwright end-to-end script
+tests/               145 pytest tests + Playwright end-to-end script (49 checks)
 ```
 
 Design rules followed:
@@ -85,6 +85,7 @@ with a clear message** instead of altering rows it cannot safely convert.
 | 0004_users_sessions_audit | `users` (role CHECK), `sessions` (token SHA-256 only), `audit_log` + trigger making it **append-only** | Authentication, authorization, auditability |
 | 0005_stock_ledger | `stock_movements.user_id`; ADJUSTMENT now stores the signed change; **one labelled "Opening balance" ADJUSTMENT per unreconciled batch** (dated before its first movement); sign CHECK | Makes the ledger reconcile for every existing batch. No batch quantity changed |
 | 0006_notifications_settings_purchasing | `app_settings` (expiry thresholds 30/90/180 days, slow-moving, lead time, cover days, currency ₵), `notifications`, `notification_reads`, `purchase_orders.created_by`, `purchase_receipts.received_by_user_id` | Configurable thresholds; notification centre; purchasing accountability |
+| 0007_dispensing | `dispensations` (one per customer/prescription: type OTC/PRESCRIPTION, optional patient name/phone, prescriber, Rx number, payment method, total, status, void details), `dispensation_items` (medicine, quantity, unit price, directions), `stock_movements.dispensation_item_id`, `medicines.selling_price`, receipt header settings | No existing table records a customer transaction, prescription, price or payment. Linking movements to lines gives batch → patient traceability (recalls) and exact-batch voids |
 
 Not added (existing relationships already suffice): roles/permissions tables
 (fixed role set in code), separate inventory table (derived from batches),
@@ -118,7 +119,8 @@ Behaviour changes to original endpoints (all deliberate fixes):
 | Users | `GET/POST /users`, `PUT /users/{id}`, `POST /users/{id}/reset-password`, `GET /roles` |
 | Medicines | `GET/POST /medicines` (search, sort), `GET/PUT /medicines/{id}` (detail: stock, FEFO order, batches, movements, purchases, risk) |
 | Inventory | `GET /inventory` (search/status/location/supplier filters), `GET /expiry-alerts`, `GET /stock-alerts`, `POST /batches`, `GET/PUT /batches/{id}` (history with running balance), `GET /stock-reconciliation` |
-| FEFO | `GET /fefo/{medicine_id}?quantity=` (plan), `POST /dispense` (allocates across batches) |
+| FEFO | `GET /fefo/{medicine_id}?quantity=` (plan), `POST /dispense` (single medicine, allocates across batches) |
+| Dispensing counter | `POST /dispensations` (multi-medicine, all-or-nothing, FEFO per line), `GET /dispensations` (date/status/search), `GET /dispensations/summary` (day totals by payment method), `GET /dispensations/{id}`, `POST /dispensations/{id}/void` (returns stock to the same batches) |
 | Movements | `GET/POST /stock-movements` (filters), `GET /stock-movements/types` |
 | Suppliers | `GET/POST /suppliers`, `GET/PUT /suppliers/{id}`, `POST /suppliers/{id}/activate`, `/deactivate` |
 | Purchasing | `GET/POST /purchase-orders`, `GET /purchase-orders/next-number`, `GET/PUT /purchase-orders/{id}`, `POST /purchase-orders/{id}/cancel`, `GET/POST /purchase-orders/{id}/items`, `PUT/DELETE /purchase-orders/{id}/items/{item_id}`, `GET/POST /purchase-receipts` |
@@ -140,6 +142,7 @@ Behaviour changes to original endpoints (all deliberate fixes):
 | Receive purchase deliveries | | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Dispense (FEFO) | | | ✓ | ✓ | ✓ | ✓ |
 | Override FEFO (with reason) | | | | ✓ | ✓ | ✓ |
+| Void a dispensation | | | | ✓ | ✓ | ✓ |
 | Edit medicines, suppliers; create/cancel POs | | | | ✓ | ✓ | ✓ |
 | Locations, settings, audit trail | | | | | ✓ | ✓ |
 | Users | | | | | | ✓ |
@@ -170,7 +173,9 @@ JavaScript (enforced by a Content-Security-Policy of `script-src 'self'`).
 The original visual design and CSS were kept and extended.
 
 Pages: Sign-in, Dashboard, Medicines (+ detail), Inventory (+ batch detail),
-Expiry Alerts (write-off), Dispense (live FEFO plan), Stock Movements,
+Expiry Alerts (write-off), **Dispensing Counter** (search → cart with live FEFO
+batches per line → prescription/OTC details → payment → printable receipt),
+Dispensing History (+ record, reprint, void), Stock Movements,
 Purchasing (+ order detail, receiving), Suppliers (+ detail), Analytics (7 tabs),
 Reports (run + CSV/Excel/PDF), AI Assistant, Notifications, Audit Trail,
 Users (+ role matrix), Settings (+ locations), My Account.
@@ -186,8 +191,8 @@ The old `frontend/app.js` and backup files were moved to `archive/` (not served)
 | Python compile of all backend modules | pass |
 | JavaScript syntax check of all 13 modules; duplicate-function scan | pass; none |
 | Backend startup (migrations check, bootstrap admin, pool, notification job) | clean |
-| `pytest` — 134 tests: migrations & data preservation, auth, lockout, sessions, permissions matrix, legacy API regression, expiry engine, FEFO, ledger reconciliation, movements, purchasing (partial/full/cancel/validation), analytics numbers checked against hand calculations, all 11 reports × 4 formats, CSV-injection, audit append-only, notifications, locations, assistant (built-in + mocked Claude tool loop), error handling, security headers | **134 passed** |
-| Playwright end-to-end (Chromium) — 44 checks: sign-in, forced password change, every page, navigation, search, sort, add/edit/validate medicine, FEFO dispensing, write-off, supplier, PO create → receive, analytics, report exports, assistant, notifications, audit, settings validation, user creation, sign-out, viewer restrictions (UI and API), mobile layout | **44/44 passed, 0 browser console/page errors** |
+| `pytest` — 145 tests (incl. 11 for the dispensing counter: multi-line FEFO, all-or-nothing, prices/totals, prescription rules, expired stock never dispensed, permissions, void to same batches, summary, report): migrations & data preservation, auth, lockout, sessions, permissions matrix, legacy API regression, expiry engine, FEFO, ledger reconciliation, movements, purchasing (partial/full/cancel/validation), analytics numbers checked against hand calculations, all 11 reports × 4 formats, CSV-injection, audit append-only, notifications, locations, assistant (built-in + mocked Claude tool loop), error handling, security headers | **145 passed** |
+| Playwright end-to-end (Chromium) — 49 checks (incl. a two-medicine prescription at the counter with FEFO, directions, NHIS payment and receipt; history search; stock deduction; void with stock returned and ledger reconciled): sign-in, forced password change, every page, navigation, search, sort, add/edit/validate medicine, FEFO dispensing, write-off, supplier, PO create → receive, analytics, report exports, assistant, notifications, audit, settings validation, user creation, sign-out, viewer restrictions (UI and API), mobile layout | **49/49 passed, 0 browser console/page errors** |
 
 Tests ran on PostgreSQL 16 in a cloud container using your dumps; your server
 is PostgreSQL 18 (the SQL used is compatible; the test loader strips the

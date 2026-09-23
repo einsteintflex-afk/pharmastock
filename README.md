@@ -1,6 +1,7 @@
 # PharmaStock
 
-Pharmacy and healthcare inventory intelligence platform: medicines, batches,
+Pharmacy and healthcare inventory intelligence platform: a community-pharmacy
+dispensing counter (prescription and OTC, receipts, voids), medicines, batches,
 expiry engine, genuine FEFO dispensing, purchasing and receiving, stock
 ledger, low-stock and reorder intelligence, expiry-risk analytics, stock
 valuation, reports (CSV / Excel / PDF), audit trail, notifications, role-based

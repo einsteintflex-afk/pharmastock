@@ -279,7 +279,33 @@ def expiry_risk_report(conn, currency, **_) -> Report:
                            ("Value at risk", f"{currency}{_money(sum(r['value_at_risk'] or 0 for r in rows))}")])
 
 
+def dispensing_report(conn, currency, date_from=None, date_to=None, **_) -> Report:
+    from . import dispensing
+
+    date_from, date_to = _period(date_from, date_to, 1)
+    rows = dispensing.search(conn, date_from=date_from, date_to=date_to, limit=100_000)
+    rows.reverse()  # oldest first for a daily sheet
+    columns = [
+        ("dispensation_number", "Number", "text"), ("dispensed_at", "Time", "datetime"),
+        ("dispense_type", "Type", "text"), ("prescription_number", "Rx no.", "text"),
+        ("medicines", "Medicines", "text"), ("units", "Units", "int"),
+        ("payment_method", "Payment", "text"), ("total_amount", "Total", "money"),
+        ("status", "Status", "text"), ("dispensed_by", "Dispensed by", "text"),
+    ]
+    completed = [r for r in rows if r["status"] == "COMPLETED"]
+    by_method: dict[str, float] = {}
+    for r in completed:
+        by_method[r["payment_method"]] = by_method.get(r["payment_method"], 0) + float(r["total_amount"])
+    return Report("dispensing", "Dispensing Report", columns, rows, subtitle=f"{date_from} to {date_to}",
+                  summary=[("Dispensations", str(len(completed))),
+                           ("Voided", str(len(rows) - len(completed))),
+                           ("Units dispensed", f"{sum(r['units'] for r in completed):,}"),
+                           ("Total sales", f"{currency}{_money(sum(by_method.values()))}")]
+                  + [(f"  {k.replace('_', ' ').title()}", f"{currency}{_money(v)}") for k, v in sorted(by_method.items())])
+
+
 REPORTS = {
+    "dispensing": ("Dispensing (daily sales)", dispensing_report, ["date_from", "date_to"]),
     "inventory": ("Inventory", inventory_report, ["location_id", "status"]),
     "expiry": ("Expiry (approaching)", expiry_report, ["location_id"]),
     "expired": ("Expired stock", expired_report, ["location_id"]),

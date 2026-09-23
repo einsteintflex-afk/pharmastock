@@ -282,6 +282,7 @@ def get_stock_alerts(location_id: int | None = None,
             "batches_in_stock": row["batches_in_stock"],
             "next_expiry": row["next_expiry"],
             "stock_value": row["stock_value"],
+            "selling_price": row["selling_price"],
         }
         for row in rows
     ]

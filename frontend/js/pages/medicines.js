@@ -12,11 +12,14 @@ const MEDICINE_FIELDS = (medicine) => [
     { name: "dosage_form", label: "Dosage form", maxlength: 50, value: medicine.dosage_form, placeholder: "e.g. Tablet" },
     { name: "reorder_level", label: "Reorder level (units)", type: "number", min: 0, step: 1, required: true,
       value: medicine.reorder_level ?? 20, help: "Low-stock alert when usable stock falls to this level." },
+    { name: "selling_price", label: "Selling price per unit", type: "number", min: 0, step: "0.01",
+      value: medicine.selling_price, help: "Default price at the dispensing counter (optional; can be changed per sale)." },
 ];
 
 function validateMedicine(values) {
     if (!values.name) return "Medicine name is required.";
     if (!Number.isInteger(values.reorder_level) || values.reorder_level < 0) return "Reorder level must be a whole number of 0 or more.";
+    if (values.selling_price !== null && (Number.isNaN(values.selling_price) || values.selling_price < 0)) return "Selling price cannot be negative.";
     return null;
 }
 
@@ -65,6 +68,7 @@ export async function renderList(ctx) {
         { label: "Usable Stock", key: "current_stock", render: m => number(m.current_stock), className: "num" },
         { label: "Expired", key: "expired_stock", render: m => m.expired_stock ? number(m.expired_stock) : "—", className: "num" },
         { label: "Reorder Level", key: "reorder_level", render: m => number(m.reorder_level), className: "num" },
+        { label: "Price", key: "selling_price", render: m => money(m.selling_price), className: "num", sort: m => Number(m.selling_price ?? -1) },
         { label: "Next Expiry", key: "next_expiry", render: m => formatDate(m.next_expiry) },
         { label: "Status", key: "status", render: m => badge(m.status) },
         { label: "Actions", render: m => html`<a class="view-btn" href="#/medicines/${m.medicine_id}">View</a>
@@ -115,6 +119,7 @@ export async function renderDetail(ctx) {
         <section class="cards">
             <div class="card"><div><span>Usable stock</span><strong>${number(m.usable_stock)}</strong><small class="card-hint">${badge(m.stock_status)}</small></div></div>
             <div class="card"><div><span>Expired on shelf</span><strong>${number(m.expired_stock)}</strong></div></div>
+            <div class="card"><div><span>Selling price</span><strong>${money(m.selling_price)}</strong></div></div>
             <div class="card"><div><span>Reorder level</span><strong>${number(m.reorder_level)}</strong>
                 <small class="card-hint">${reorder?.reorder_recommended ? `Reorder ${number(reorder.recommended_quantity)} units` : "No reorder needed"}</small></div></div>
             <div class="card"><div><span>Stock value</span><strong>${money(m.stock_value)}</strong>
@@ -178,7 +183,7 @@ export async function renderDetail(ctx) {
     const { openBatchForm } = await import("./inventory.js");
     onAction(ctx.main, {
         edit: () => openMedicineForm({ id: m.medicine_id, name: m.medicine, strength: m.strength,
-            dosage_form: m.dosage_form, reorder_level: m.reorder_level }, () => ctx.reload()),
+            dosage_form: m.dosage_form, reorder_level: m.reorder_level, selling_price: m.selling_price }, () => ctx.reload()),
         "add-batch": () => openBatchForm(m.medicine_id, () => ctx.reload()),
     });
 }

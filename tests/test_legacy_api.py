@@ -70,7 +70,8 @@ def test_create_and_update_medicine(api, db):
                                       "reorder_level": 30})
     assert created.status_code == 200
     medicine = created.json()
-    assert set(medicine) == {"id", "name", "strength", "dosage_form", "reorder_level"}
+    # Original fields unchanged; selling_price is an addition.
+    assert {"id", "name", "strength", "dosage_form", "reorder_level"} <= set(medicine)
 
     updated = api.put(f"/medicines/{medicine['id']}", {"name": "Metformin", "strength": "500 mg",
                                                        "dosage_form": "Tablet", "reorder_level": 45})

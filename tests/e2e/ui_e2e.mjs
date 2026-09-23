@@ -97,7 +97,8 @@ await check("dashboard shows live figures", async () => {
 });
 
 const pages = {
-    medicines: "Medicines", inventory: "Inventory", expiry: "Expiry Alerts", dispense: "Dispense (FEFO)",
+    medicines: "Medicines", inventory: "Inventory", expiry: "Expiry Alerts", dispense: "Dispensing Counter",
+    dispensations: "Dispensing History",
     movements: "Stock Movements", purchasing: "Purchasing", suppliers: "Suppliers", analytics: "Analytics",
     reports: "Reports", assistant: "AI Inventory Assistant", notifications: "Notifications", audit: "Audit Trail",
     users: "Users", settings: "Settings", account: "My Account",
@@ -189,25 +190,73 @@ await check("medicine detail shows FEFO order", async () => {
     await shot(page, "03-medicine-detail");
 });
 
-await check("dispense uses FEFO across batches", async () => {
-    await go(page, "dispense?medicine=1");
-    await page.fill("#d-quantity", "60");
-    await page.waitForFunction(() => document.querySelectorAll("#fefo-plan tbody tr").length === 2);
-    const plan = await page.$$eval("#fefo-plan tbody tr", trs => trs.map(t => t.innerText));
-    expect(plan[0].includes("PARA002") && plan[1].includes("PARA003"), `plan: ${plan}`);
-    await page.fill("#d-reason", "E2E Rx 42");
-    await page.click("#dispense-form button[type=submit]");
-    await page.waitForSelector("#dispense-done");
-    const done = await page.$$eval("#dispense-done tbody tr", trs => trs.map(t => t.innerText));
-    expect(done.length === 2 && done[0].includes("50") && done[1].includes("10"), `done: ${done}`);
-    await shot(page, "04-dispense");
+await check("set a selling price on a medicine", async () => {
+    await go(page, "medicines/1");
+    await page.click('[data-action="edit"]');
+    await page.fill("#f-selling_price", "0.50");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector(".modal", { state: "detached" });
+    await page.waitForFunction(() => document.querySelector(".cards")?.innerText.includes("0.50"));
+});
+
+let dispensationUrl = "";
+await check("dispensing counter: prescription with two medicines, FEFO, receipt", async () => {
+    await go(page, "dispense");
+    await page.fill("#c-search", "parac");
+    await page.press("#c-search", "Enter");
+    await page.waitForSelector('table.cart input.qty[data-index="0"]');
+    await page.fill('input.qty[data-index="0"]', "60");
+    await page.waitForFunction(() => document.querySelector('tr[data-row="0"] .batch-note').innerText.includes("PARA003"));
+    const note = await page.textContent('tr[data-row="0"] .batch-note');
+    expect(note.includes("PARA002 ×50") && note.includes("PARA003 ×10") && !note.includes("PARA004"), `FEFO note: ${note}`);
+    await page.fill('input.directions-input[data-index="0"]', "2 tablets three times daily after meals");
+    // Second medicine, unpriced -> price entered at the counter.
+    await page.click('.pick >> text=Amoxicillin');
+    await page.waitForSelector('input.qty[data-index="1"]');
+    await page.fill('input.qty[data-index="1"]', "21");
+    await page.fill('input.price[data-index="1"]', "1.20");
+    await page.waitForFunction(() => document.getElementById("c-total").innerText.includes("55.20"));
+    // Prescription details are required for a prescription.
+    await page.check('input[name="dispense_type"][value="PRESCRIPTION"]');
+    await page.click("#c-form button[type=submit]");
+    await page.waitForSelector("#c-form .form-error:not([hidden])");
+    await page.fill("#c-prescriber", "Dr. Ama Boateng");
+    await page.fill("#c-rx", "RX-E2E-" + stamp);
+    await page.fill("#c-patient", "Kofi Asante");
+    await page.selectOption("#c-payment", "NHIS");
+    await page.click("#c-form button[type=submit]");
+    await page.waitForSelector(".modal .receipt");
+    const receipt = await page.textContent(".modal .receipt");
+    expect(receipt.includes("Kofi Asante") && receipt.includes("Dr. Ama Boateng") && receipt.includes("55.20")
+        && receipt.includes("NHIS") && receipt.includes("PARA002"), `receipt: ${receipt}`);
+    dispensationUrl = await page.getAttribute('.modal a[href^="#/dispensations/"]', "href");
+    await shot(page, "04-dispensing-receipt");
+    await page.click(".modal [data-close]:not(.modal-backdrop)");
+    const cartEmpty = await page.textContent("#c-cart");
+    expect(cartEmpty.includes("No items"), "cart not cleared");
+    await shot(page, "04b-dispensing-counter");
+});
+
+await check("dispensing history shows the sale; search works", async () => {
+    await go(page, "dispensations");
+    await page.waitForSelector("#dispensations-table tbody tr");
+    await page.fill("#h-search", "Kofi");
+    await page.waitForFunction(() => document.querySelectorAll("#dispensations-table tbody tr").length === 1
+        && document.querySelector("#dispensations-table").innerText.includes("Kofi Asante"));
+});
+
+await check("stock deducted by dispensing", async () => {
+    const stock = await page.evaluate(() => fetch("/stock-alerts").then(r => r.json()));
+    const para = stock.find(m => m.medicine === "Paracetamol");
+    const amox = stock.find(m => m.medicine === "Amoxicillin");
+    expect(para.current_stock === 120 && amox.current_stock === 259, `para ${para.current_stock} amox ${amox.current_stock}`);
 });
 
 await check("stock movements list shows dispensing with user", async () => {
     await go(page, "movements");
     await page.waitForSelector("#movements-table tbody tr");
     const text = await page.textContent("#movements-table");
-    expect(text.includes("E2E Rx 42") && text.includes("Administrator"), "movement not listed");
+    expect(text.includes("Dispensation DSP-") && text.includes("Administrator"), "movement not listed");
 });
 
 await check("inventory filter by status", async () => {
@@ -319,7 +368,20 @@ await check("notifications: list and mark all read", async () => {
 await check("audit trail records UI actions", async () => {
     await go(page, "audit");
     const text = await page.textContent("#audit-table");
-    expect(text.includes("DISPENSE_FEFO") && text.includes("RECEIVE") && text.includes("PASSWORD_CHANGED"), "missing entries");
+    expect(text.includes("DISPENSE") && text.includes("RECEIVE") && text.includes("PASSWORD_CHANGED"), "missing entries");
+});
+
+await check("void dispensation returns stock", async () => {
+    await page.goto(`${BASE}/app/${dispensationUrl}`);
+    await page.waitForSelector('[data-action="void"]');
+    await page.click('[data-action="void"]');
+    await page.fill("#f-reason", "Entered against the wrong patient");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector(".receipt-void");
+    const stock = await page.evaluate(() => fetch("/stock-alerts").then(r => r.json()));
+    expect(stock.find(m => m.medicine === "Paracetamol").current_stock === 180, "paracetamol not returned");
+    const rec = await page.evaluate(() => fetch("/stock-reconciliation").then(r => r.json()));
+    expect(rec.reconciled, "ledger not reconciled after void");
 });
 
 await check("settings change updates thresholds", async () => {

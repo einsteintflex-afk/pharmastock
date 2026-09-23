@@ -16,6 +16,9 @@ SETTING_RULES = {
     "reorder.lead_time_days": (int, 0, 365),
     "reorder.cover_days": (int, 1, 365),
     "currency.symbol": (str, 1, 5),
+    "pharmacy.name": (str, 1, 150),
+    "pharmacy.address": (str, 0, 255),
+    "pharmacy.phone": (str, 0, 50),
 }
 
 

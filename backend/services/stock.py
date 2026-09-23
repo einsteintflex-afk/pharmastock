@@ -70,14 +70,15 @@ def insert_movement(
     quantity: int,
     reason: str | None,
     user: CurrentUser | None,
+    dispensation_item_id: int | None = None,
 ) -> dict:
     return conn.execute(
         """
-        INSERT INTO stock_movements (batch_id, movement_type, quantity, reason, user_id)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO stock_movements (batch_id, movement_type, quantity, reason, user_id, dispensation_item_id)
+        VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id, batch_id, movement_type, quantity, movement_date, reason
         """,
-        (batch_id, movement_type, quantity, reason, user.id if user else None),
+        (batch_id, movement_type, quantity, reason, user.id if user else None, dispensation_item_id),
     ).fetchone()
 
 
@@ -138,32 +139,29 @@ def fefo_plan(
     }
 
 
-def dispense_fefo(
+def allocate_fefo(
     conn: psycopg.Connection,
     user: CurrentUser,
     medicine_id: int,
     quantity: int,
     location_id: int | None,
     reason: str | None,
-) -> dict:
-    """Dispense using genuine FEFO: lock the medicine's usable batches, then
-    take from the earliest-expiring first."""
+    dispensation_item_id: int | None = None,
+) -> list[dict]:
+    """Take `quantity` units of a medicine from its usable batches, earliest
+    expiry first (batches locked). Raises 400 without changing anything when
+    usable stock is insufficient. Returns one entry per batch used."""
     if quantity <= 0:
         raise HTTPException(status_code=400, detail="Quantity must be greater than zero")
 
-    medicine = conn.execute(
-        "SELECT id, name, strength, dosage_form FROM medicines WHERE id = %s", (medicine_id,)
-    ).fetchone()
-    if medicine is None:
-        raise HTTPException(status_code=404, detail="Medicine not found")
-
     plan = fefo_plan(conn, medicine_id, quantity, location_id, lock=True)
-
     if plan["shortfall"] > 0:
+        name = conn.execute("SELECT name FROM medicines WHERE id = %s", (medicine_id,)).fetchone()
         raise HTTPException(
             status_code=400,
             detail={
-                "message": "Insufficient usable (non-expired) stock",
+                "message": f"Insufficient usable (non-expired) stock of {name['name'] if name else 'this medicine'}",
+                "medicine_id": medicine_id,
                 "requested": quantity,
                 "available_usable_stock": plan["available_usable_stock"],
             },
@@ -177,7 +175,7 @@ def dispense_fefo(
         )
         movement = insert_movement(
             conn, allocation["batch_id"], "DISPENSED", allocation["allocate"],
-            reason or "Dispensed (FEFO)", user,
+            reason or "Dispensed (FEFO)", user, dispensation_item_id,
         )
         movements.append({
             "movement_id": movement["id"],
@@ -187,8 +185,31 @@ def dispense_fefo(
             "quantity": allocation["allocate"],
             "batch_quantity_after": allocation["remaining_after"],
         })
+    return movements
 
-    result = {
+
+def dispense_fefo(
+    conn: psycopg.Connection,
+    user: CurrentUser,
+    medicine_id: int,
+    quantity: int,
+    location_id: int | None,
+    reason: str | None,
+) -> dict:
+    """Quick single-medicine dispense (POST /dispense) using genuine FEFO."""
+    medicine = conn.execute(
+        "SELECT id, name, strength, dosage_form FROM medicines WHERE id = %s", (medicine_id,)
+    ).fetchone()
+    if medicine is None:
+        raise HTTPException(status_code=404, detail="Medicine not found")
+
+    movements = allocate_fefo(conn, user, medicine_id, quantity, location_id, reason)
+
+    audit.record(conn, user, "DISPENSE_FEFO", "medicine", medicine_id, None, {
+        "quantity": quantity, "reason": reason,
+        "batches": [{"batch_id": m["batch_id"], "quantity": m["quantity"]} for m in movements],
+    })
+    return {
         "medicine_id": medicine_id,
         "medicine": medicine["name"],
         "strength": medicine["strength"],
@@ -196,11 +217,6 @@ def dispense_fefo(
         "quantity_dispensed": quantity,
         "movements": movements,
     }
-    audit.record(conn, user, "DISPENSE_FEFO", "medicine", medicine_id, None, {
-        "quantity": quantity, "reason": reason,
-        "batches": [{"batch_id": m["batch_id"], "quantity": m["quantity"]} for m in movements],
-    })
-    return result
 
 
 def record_movement(

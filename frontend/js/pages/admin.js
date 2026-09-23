@@ -90,7 +90,7 @@ export async function renderAudit(ctx) {
         <section class="section">
             <div class="toolbar">
                 <select id="a-entity" aria-label="Entity"><option value="">All entities</option>
-                    ${["medicine", "batch", "supplier", "purchase_order", "user", "location", "setting", "report", "assistant"].map(e => html`<option>${e}</option>`)}</select>
+                    ${["medicine", "batch", "dispensation", "supplier", "purchase_order", "user", "location", "setting", "report", "assistant"].map(e => html`<option>${e}</option>`)}</select>
                 <input id="a-action" placeholder="Action (e.g. UPDATE, LOGIN_FAILED)" aria-label="Action">
                 <label>From <input type="date" id="a-from" value="${today(-30)}"></label>
                 <label>To <input type="date" id="a-to" value="${today()}"></label>
@@ -186,6 +186,9 @@ export async function renderSettings(ctx) {
                 { name: "reorder.lead_time_days", label: "Supplier lead time (days)", type: "number", min: 0, step: 1, value: value("reorder.lead_time_days"), required: true },
                 { name: "reorder.cover_days", label: "Reorder covers (days)", type: "number", min: 1, step: 1, value: value("reorder.cover_days"), required: true },
                 { name: "currency.symbol", label: "Currency symbol", maxlength: 5, value: value("currency.symbol"), required: true },
+                { name: "pharmacy.name", label: "Pharmacy name (receipts)", maxlength: 150, value: value("pharmacy.name"), required: true },
+                { name: "pharmacy.phone", label: "Pharmacy phone (receipts)", maxlength: 50, value: value("pharmacy.phone"), emptyValue: "" },
+                { name: "pharmacy.address", label: "Pharmacy address (receipts)", maxlength: 255, value: value("pharmacy.address"), emptyValue: "", full: true },
             ];
             formModal({
                 title: "Edit settings",
