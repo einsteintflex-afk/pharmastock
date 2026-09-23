@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>PharmaStock Dashboard</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div class="app">
+
+        <!-- SIDEBAR -->
+        <aside class="sidebar">
+
+            <div class="brand">
+                <div class="brand-icon">P</div>
+
+                <div>
+                    <h1>PharmaStock</h1>
+                    <span>Inventory Intelligence</span>
+                </div>
+            </div>
+
+            <nav>
+
+                <button class="nav-item active" onclick="showDashboard()">
+                    <span>▣</span>
+                    Dashboard
+                </button>
+
+  <button class="nav-item" onclick="showMedicines()">
+    <span>💊</span>
+    Medicines
+</button>
+                <button class="nav-item">
+                    <span>📦</span>
+                    Inventory
+                </button>
+
+                <button class="nav-item">
+                    <span>⚠</span>
+                    Expiry Alerts
+                </button>
+
+                <button class="nav-item">
+                    <span>↔</span>
+                    Stock Movements
+                </button>
+
+                <button class="nav-item">
+                    <span>🛒</span>
+                    Purchasing
+                </button>
+
+                <button class="nav-item">
+                    <span>🚚</span>
+                    Suppliers
+                </button>
+
+                <button class="nav-item">
+                    <span>📊</span>
+                    Analytics
+                </button>
+
+            </nav>
+
+            <div class="sidebar-bottom">
+
+                <button class="nav-item">
+                    <span>⚙</span>
+                    Settings
+                </button>
+
+                <div class="system-status">
+                    <span class="status-dot"></span>
+                    <div>
+                        <strong>System Online</strong>
+                        <small>Database connected</small>
+                    </div>
+                </div>
+
+            </div>
+
+        </aside>
+
+
+        <!-- MAIN CONTENT -->
+        <main class="main">
+
+            <!-- TOP BAR -->
+            <header class="topbar">
+
+                <div>
+                    <h2>Dashboard</h2>
+                    <p>Pharmacy inventory overview</p>
+                </div>
+
+                <div class="top-actions">
+
+                    <button class="refresh-btn" onclick="loadDashboard()">
+                        ↻ Refresh
+                    </button>
+
+                    <div class="user">
+                        <div class="avatar">T</div>
+
+                        <div>
+                            <strong>Pharmacy User</strong>
+                            <small>Administrator</small>
+                        </div>
+                    </div>
+
+                </div>
+
+            </header>
+
+
+            <!-- DASHBOARD CARDS -->
+            <section class="cards">
+
+                <div class="card">
+
+                    <div class="card-icon blue">
+                        💊
+                    </div>
+
+                    <div>
+                        <span>Total Medicines</span>
+                        <strong id="totalMedicines">—</strong>
+                    </div>
+
+                </div>
+
+
+                <div class="card">
+
+                    <div class="card-icon green">
+                        📦
+                    </div>
+
+                    <div>
+                        <span>Total Stock</span>
+                        <strong id="totalStock">—</strong>
+                    </div>
+
+                </div>
+
+
+                <div class="card">
+
+                    <div class="card-icon red">
+                        ⚠
+                    </div>
+
+                    <div>
+                        <span>Expired</span>
+                        <strong id="expiredCount">—</strong>
+                    </div>
+
+                </div>
+
+
+                <div class="card">
+
+                    <div class="card-icon orange">
+                        ⏱
+                    </div>
+
+                    <div>
+                        <span>Urgent Expiry</span>
+                        <strong id="urgentCount">—</strong>
+                    </div>
+
+                </div>
+
+            </section>
+
+
+            <!-- ALERTS -->
+            <section class="section">
+
+                <div class="section-header">
+
+                    <div>
+                        <h3>Expiry Alerts</h3>
+                        <p>Products requiring attention</p>
+                    </div>
+
+                    <button class="view-btn">
+                        View all
+                    </button>
+
+                </div>
+
+
+                <div class="table-container">
+
+                    <table>
+
+                        <thead>
+
+                            <tr>
+                                <th>Medicine</th>
+                                <th>Batch</th>
+                                <th>Quantity</th>
+                                <th>Expiry Date</th>
+                                <th>Days Remaining</th>
+                                <th>Status</th>
+                            </tr>
+
+                        </thead>
+
+                        <tbody id="expiryTable">
+
+                            <tr>
+                                <td colspan="6" class="loading">
+                                    Loading inventory...
+                                </td>
+                            </tr>
+
+                        </tbody>
+
+                    </table>
+
+                </div>
+
+            </section>
+
+
+            <!-- LOWER GRID -->
+            <div class="lower-grid">
+
+
+                <!-- STOCK -->
+                <section class="section">
+
+                    <div class="section-header">
+
+                        <div>
+                            <h3>Stock Overview</h3>
+                            <p>Current inventory levels</p>
+                        </div>
+
+                    </div>
+
+
+                    <div class="table-container">
+
+                        <table>
+
+                            <thead>
+
+                                <tr>
+                                    <th>Medicine</th>
+                                    <th>Stock</th>
+                                    <th>Reorder Level</th>
+                                    <th>Status</th>
+                                </tr>
+
+                            </thead>
+
+                            <tbody id="stockTable">
+
+                                <tr>
+                                    <td colspan="4" class="loading">
+                                        Loading stock...
+                                    </td>
+                                </tr>
+
+                            </tbody>
+
+                        </table>
+
+                    </div>
+
+                </section>
+
+
+                <!-- RECENT MOVEMENTS -->
+                <section class="section">
+
+                    <div class="section-header">
+
+                        <div>
+                            <h3>Recent Movements</h3>
+                            <p>Latest stock activity</p>
+                        </div>
+
+                    </div>
+
+
+                    <div id="movementList" class="movement-list">
+
+                        <div class="loading">
+                            Loading movements...
+                        </div>
+
+                    </div>
+
+                </section>
+
+            </div>
+
+        </main>
+
+    </div>
+
+
+    <script src="app.js"></script>
+
+</body>
+</html>
