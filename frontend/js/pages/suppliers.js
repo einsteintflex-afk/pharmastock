@@ -1,7 +1,7 @@
 /* Suppliers: list, search, add, edit, activate/deactivate, detail. */
 
 import {
-    api, badge, debounce, formModal, formatDate, html, money, mount, number, onAction, pageHeader, sortableTable,
+    api, badge, debounce, formModal, formatDate, formatDateTime, html, money, mount, number, onAction, pageHeader, sortableTable,
     statTile, table, toast,
 } from "../core.js";
 
@@ -120,6 +120,28 @@ export async function renderDetail(ctx) {
                     { label: "Avg cost", render: p => money(p.average_unit_cost) },
                     { label: "Last ordered", render: p => formatDate(p.last_ordered) },
                 ], data.products_supplied, { empty: "No products ordered yet." })}
+            </section>
+        </div>
+        <div class="lower-grid">
+            <section class="section">
+                <div class="section-header"><div><h3>Receipt history</h3>
+                    <p>${number(data.summary.receipts)} deliveries · ${number(data.summary.units_received)} units${data.summary.last_receipt_date ? ` · last ${formatDate(data.summary.last_receipt_date)}` : ""}</p></div></div>
+                ${table("sup-receipts", [
+                    { label: "Received", render: r => formatDateTime(r.received_date) },
+                    { label: "Order", render: r => html`<a href="#/purchasing/${r.purchase_order_id}">${r.order_number}</a>` },
+                    { label: "Medicine / batch", render: r => html`<a href="#/medicines/${r.medicine_id}">${r.medicine}</a>
+                        <br><small><a href="#/batches/${r.batch_id}">${r.batch_number}</a> · exp ${formatDate(r.expiry_date)}</small>` },
+                    { label: "Qty", render: r => number(r.quantity_received), className: "num" },
+                    { label: "Value", render: r => money(r.value), className: "num" },
+                ], data.receipts, { empty: "Nothing received yet." })}
+            </section>
+            <section class="section">
+                <div class="section-header"><div><h3>Activity</h3><p>Changes to this supplier and its orders</p></div></div>
+                ${table("sup-activity", [
+                    { label: "When", render: a => formatDateTime(a.occurred_at) },
+                    { label: "User", render: a => a.username || "system" },
+                    { label: "Action", render: a => html`<strong>${a.action}</strong>${a.order_number ? html` <small>${a.order_number}</small>` : ""}` },
+                ], data.activity, { empty: "No activity recorded." })}
             </section>
         </div>`);
 

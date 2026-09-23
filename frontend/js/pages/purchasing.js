@@ -169,12 +169,14 @@ export async function renderDetail(ctx) {
                 ctx.reload();
             } catch (error) { toast(error.message, "error"); }
         },
-        receive: el => {
+        receive: async el => {
             const line = item(el);
-            formModal({
+            const form = formModal({
                 title: `Receive ${line.medicine} ${line.strength || ""}`,
                 intro: `${number(line.quantity_remaining)} of ${number(line.quantity_ordered)} units outstanding at ${money(line.unit_cost)} each. Receiving into an existing batch number adds to that batch.`,
                 fields: [
+                    { name: "barcode_data", label: "Scan pack barcode (optional)", maxlength: 200, full: true, autocomplete: "off",
+                      help: "A GS1 DataMatrix scan fills in the batch number and expiry date and checks the product." },
                     { name: "batch_number", label: "Batch number", required: true, maxlength: 100 },
                     { name: "expiry_date", label: "Expiry date", type: "date", required: true },
                     { name: "quantity_received", label: "Quantity received", type: "number", min: 1, max: line.quantity_remaining,
@@ -194,6 +196,15 @@ export async function renderDetail(ctx) {
                     toast(`Received. Batch now holds ${number(result.new_batch_quantity)}; order ${result.purchase_order_status.replaceAll("_", " ").toLowerCase()}.`);
                     ctx.reload();
                 },
+            });
+            const { wireScanInput } = await import("./scan.js");
+            wireScanInput(form.elements.barcode_data, result => {
+                if (result.medicine && result.medicine.id !== line.medicine_id) {
+                    toast(`This pack is ${result.medicine.name}, not ${line.medicine}.`, "error");
+                    return;
+                }
+                if (result.parsed.batch_number) form.elements.batch_number.value = result.parsed.batch_number;
+                if (result.parsed.expiry_date) form.elements.expiry_date.value = result.parsed.expiry_date;
             });
         },
         notes: () => formModal({

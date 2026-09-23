@@ -95,6 +95,34 @@ const BADGE_CLASS = {
     "NEW DEMAND": "info", "CRITICAL_SEV": "expired", "WARNING": "urgent", "INFO": "info",
     "DISPENSED": "urgent", "RETURNED": "info", "DAMAGED": "expired", "ADJUSTMENT": "muted",
     "Active": "normal", "Inactive": "muted",
+    "TRANSFER_OUT": "info", "TRANSFER_IN": "info", "REQUESTED": "urgent", "APPROVED": "info",
+    "DISPATCHED": "approaching", "REJECTED": "expired", "URGENT_PRIORITY": "expired", "ROUTINE": "muted",
+    "QUARANTINED": "urgent", "RECALLED": "expired", "PENDING": "urgent", "SENT": "normal", "FAILED": "expired",
+    "SKIPPED": "muted", "INSUFFICIENT": "expired", "LIMITED": "urgent", "ADEQUATE": "normal",
+    "TRIAL": "info", "SUSPENDED": "expired", "BASIC": "muted", "PROFESSIONAL": "info", "ENTERPRISE": "normal",
+    "COMPLETED": "normal", "VOIDED": "muted",
+};
+
+/* Signed effect of a movement on stock (ADJUSTMENT is stored signed). */
+const INBOUND_TYPES = new Set(["RECEIVED", "RETURNED", "TRANSFER_IN"]);
+export function signedQuantity(movement) {
+    if (movement.movement_type === "ADJUSTMENT") return movement.quantity > 0 ? `+${movement.quantity}` : `${movement.quantity}`;
+    return (INBOUND_TYPES.has(movement.movement_type) ? "+" : "−") + movement.quantity;
+}
+export function movementDirection(movement) {
+    if (movement.movement_type === "ADJUSTMENT") return movement.quantity > 0 ? "received" : "dispensed";
+    return INBOUND_TYPES.has(movement.movement_type) ? "received" : "dispensed";
+}
+
+/* ---------- Browser storage (optional: may be blocked) ---------- */
+
+export const store = {
+    get(key, fallback = null) {
+        try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; }
+    },
+    set(key, value) {
+        try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ }
+    },
 };
 
 export function badge(value, override) {
@@ -282,6 +310,35 @@ export function sortableTable(container, id, columns, rows, options = {}) {
         });
     });
     options.afterRender?.(container);
+}
+
+/* ---------- Pagination ---------- */
+
+/**
+ * Pager controls for server-paged lists (X-Total-Count). Returns SafeHtml;
+ * wire it with bindPager(). page is 0-based.
+ */
+export function pager(id, total, page, size) {
+    const pages = Math.max(1, Math.ceil(total / size));
+    if (total <= size) return html`<div class="pager" id="${id}"><span>${total.toLocaleString()} total</span></div>`;
+    return html`<div class="pager" id="${id}">
+        <button type="button" class="view-btn" data-page="${page - 1}" ${page <= 0 ? html`disabled` : ""}>‹ Previous</button>
+        <span>Page ${page + 1} of ${pages} · ${total.toLocaleString()} total</span>
+        <button type="button" class="view-btn" data-page="${page + 1}" ${page >= pages - 1 ? html`disabled` : ""}>Next ›</button>
+    </div>`;
+}
+
+export function bindPager(root, id, onPage) {
+    root.querySelectorAll(`#${id} [data-page]`).forEach(button =>
+        button.addEventListener("click", () => onPage(Number(button.dataset.page))));
+}
+
+/** Fetch one page: returns { rows, total }. */
+export async function apiPage(path, params, page, size) {
+    const response = await api(path, { params: { ...params, limit: size, offset: page * size }, raw: true });
+    const body = await response.json();
+    const rows = Array.isArray(body) ? body : body.rows || body.deliveries || [];
+    return { rows, total: Number(response.headers.get("X-Total-Count") || rows.length), body };
 }
 
 /* ---------- Event helpers ---------- */

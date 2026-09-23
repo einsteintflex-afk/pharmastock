@@ -1,18 +1,9 @@
 /* Dashboard: headline figures, expiry, low stock, risk, reorder, movements. */
 
-import { api, badge, daysLabel, formatDate, formatDateTime, html, money, mount, number, pageHeader, plural, statTile, table } from "../core.js";
-
-const INBOUND = new Set(["RECEIVED", "RETURNED"]);
-
-function signedQuantity(movement) {
-    if (movement.movement_type === "ADJUSTMENT") return movement.quantity > 0 ? `+${movement.quantity}` : `${movement.quantity}`;
-    return (INBOUND.has(movement.movement_type) ? "+" : "−") + movement.quantity;
-}
-
-function movementDirection(movement) {
-    if (movement.movement_type === "ADJUSTMENT") return movement.quantity > 0 ? "received" : "dispensed";
-    return INBOUND.has(movement.movement_type) ? "received" : "dispensed";
-}
+import {
+    api, badge, daysLabel, formatDate, formatDateTime, html, money, mount, movementDirection, number, pageHeader, plural,
+    signedQuantity, statTile, table,
+} from "../core.js";
 
 export async function render(ctx) {
     const [data, alerts] = await Promise.all([api("/dashboard"), api("/expiry-alerts")]);
@@ -127,6 +118,45 @@ export async function render(ctx) {
             </section>
         </div>
 
+        <div class="lower-grid">
+            <section class="section">
+                <div class="section-header">
+                    <div><h3>Recent Purchases</h3><p>Latest purchase orders</p></div>
+                    <a class="view-btn" href="#/purchasing">Purchasing</a>
+                </div>
+                ${table("dash-purchases", [
+                    { label: "Order", render: p => html`<a href="#/purchasing/${p.id}">${p.order_number}</a><br><small>${formatDate(p.order_date)}</small>` },
+                    { label: "Supplier", key: "supplier" },
+                    { label: "Value", render: p => money(p.order_value), className: "num" },
+                    { label: "Status", render: p => badge(p.status) },
+                ], data.recent_purchases, { empty: "No purchase orders yet." })}
+            </section>
+            <section class="section">
+                <div class="section-header">
+                    <div><h3>Supplier Activity</h3><p>Latest deliveries received</p></div>
+                    <a class="view-btn" href="#/suppliers">Suppliers</a>
+                </div>
+                ${table("dash-supplier-activity", [
+                    { label: "Received", render: r => formatDateTime(r.received_date) },
+                    { label: "Supplier", key: "supplier" },
+                    { label: "Medicine", key: "medicine" },
+                    { label: "Qty", render: r => number(r.quantity_received), className: "num" },
+                    { label: "Order", render: r => html`<a href="#/purchasing/${r.purchase_order_id}">${r.order_number}</a>` },
+                ], data.supplier_activity, { empty: "No deliveries received yet." })}
+            </section>
+        </div>
+
+        ${data.open_transfers && (data.open_transfers.awaiting_approval || data.open_transfers.awaiting_dispatch
+            || data.open_transfers.in_transit || data.held_batches.batches) ? html`
+        <section class="section today-strip">
+            <div><h3>Transfers & held stock</h3>
+                <p>${plural(data.open_transfers.awaiting_approval, "request")} awaiting approval ·
+                ${number(data.open_transfers.awaiting_dispatch)} awaiting dispatch · ${number(data.open_transfers.in_transit)} in transit ·
+                ${plural(data.held_batches.batches, "batch", "batches")} quarantined / recalled (${number(data.held_batches.units)} units)</p></div>
+            ${ctx.can("inventory.read") && ctx.hasFeature("multi_location")
+                ? html`<a class="view-btn" href="#/transfers">Transfers</a>` : ""}
+        </section>` : ""}
+
         ${data.slow_moving.length ? html`
         <section class="section">
             <div class="section-header"><div><h3>Slow-moving Stock</h3><p>Medicines holding stock with little or no dispensing in 90 days</p></div></div>
@@ -142,4 +172,4 @@ export async function render(ctx) {
     ctx.main.querySelector("#dash-refresh").addEventListener("click", () => ctx.reload());
 }
 
-export { signedQuantity, movementDirection };
+

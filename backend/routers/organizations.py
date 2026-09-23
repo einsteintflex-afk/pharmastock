@@ -88,7 +88,8 @@ def platform_list(user: CurrentUser = Depends(require_platform_admin), conn: psy
         GROUP BY o.id ORDER BY o.id
         """
     ).fetchall()
-    return [{**row, **plans.effective(row)} for row in rows]
+    # "limits" becomes the effective limits; the stored overrides stay visible.
+    return [{**row, "limit_overrides": row["limits"] or {}, **plans.effective(row)} for row in rows]
 
 
 @router.post("/platform/organizations", tags=["Platform"], status_code=201)

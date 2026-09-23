@@ -1,10 +1,9 @@
 /* Medicines: list, search, filter, sort, add, edit, detail. */
 
 import {
-    api, badge, daysLabel, debounce, formModal, formatDate, formatDateTime, html, money, mount, number, onAction,
-    pageHeader, sortableTable, table, toast,
+    api, badge, daysLabel, debounce, formatDate, formatDateTime, formModal, html, money, mount, number,
+    onAction, pageHeader, signedQuantity, sortableTable, table, toast,
 } from "../core.js";
-import { signedQuantity } from "./dashboard.js";
 
 const MEDICINE_FIELDS = (medicine) => [
     { name: "name", label: "Medicine name", required: true, maxlength: 150, value: medicine.name, placeholder: "e.g. Paracetamol" },
@@ -14,6 +13,15 @@ const MEDICINE_FIELDS = (medicine) => [
       value: medicine.reorder_level ?? 20, help: "Low-stock alert when usable stock falls to this level." },
     { name: "selling_price", label: "Selling price per unit", type: "number", min: 0, step: "0.01",
       value: medicine.selling_price, help: "Default price at the dispensing counter (optional; can be changed per sale)." },
+    { name: "generic_name", label: "Generic name (INN)", maxlength: 150, value: medicine.generic_name, placeholder: "e.g. Amoxicillin" },
+    { name: "brand_name", label: "Brand name", maxlength: 150, value: medicine.brand_name, placeholder: "e.g. Amoxil" },
+    { name: "route", label: "Route", type: "select", placeholder: "—", value: medicine.route,
+      options: ["Oral", "Topical", "Intravenous", "Intramuscular", "Subcutaneous", "Inhalation", "Rectal", "Vaginal",
+                "Ophthalmic", "Otic", "Nasal", "Sublingual", "Transdermal", "Other"].map(r => ({ value: r, label: r })) },
+    { name: "manufacturer", label: "Manufacturer", maxlength: 150, value: medicine.manufacturer },
+    { name: "gtin", label: "Barcode / GTIN", maxlength: 20, value: medicine.gtin, autocomplete: "off",
+      help: "Scan or type the pack barcode (EAN-13 / GTIN-14). Used by barcode scanning." },
+    { name: "is_active", label: "Active (can be ordered and stocked)", type: "checkbox", value: medicine.is_active ?? true },
 ];
 
 function validateMedicine(values) {
@@ -41,8 +49,10 @@ export function openMedicineForm(medicine, onSaved) {
 }
 
 export async function renderList(ctx) {
-    const stock = await api("/stock-alerts");
+    const [levels, master] = await Promise.all([api("/stock-alerts"), api("/medicines")]);
     if (!ctx.isCurrent()) return;
+    const byId = new Map(master.map(m => [m.id, m]));
+    const stock = levels.map(level => ({ ...byId.get(level.medicine_id), ...level }));
 
     const canWrite = ctx.can("medicines.write");
     mount(ctx.main, html`
@@ -51,10 +61,15 @@ export async function renderList(ctx) {
             ${canWrite ? html`<button type="button" class="refresh-btn primary" data-action="add">+ Add Medicine</button>` : ""}`)}
         <section class="section">
             <div class="toolbar">
-                <input type="search" id="med-search" placeholder="Search name, strength or form…" aria-label="Search medicines">
+                <input type="search" id="med-search" placeholder="Search name, brand, generic, strength, form or barcode…" aria-label="Search medicines">
                 <select id="med-status" aria-label="Filter by stock status">
                     <option value="">All stock statuses</option>
                     <option>NORMAL</option><option>LOW STOCK</option><option>OUT OF STOCK</option>
+                </select>
+                <select id="med-active" aria-label="Filter by active status">
+                    <option value="active">Active medicines</option>
+                    <option value="inactive">Inactive (discontinued)</option>
+                    <option value="">All medicines</option>
                 </select>
                 <span class="toolbar-count" id="med-count"></span>
             </div>
@@ -62,7 +77,9 @@ export async function renderList(ctx) {
         </section>`);
 
     const columns = [
-        { label: "Medicine", key: "medicine", render: m => html`<a href="#/medicines/${m.medicine_id}"><strong>${m.medicine}</strong></a>` },
+        { label: "Medicine", key: "medicine", render: m => html`<a href="#/medicines/${m.medicine_id}"><strong>${m.medicine}</strong></a>
+            ${m.brand_name || (m.generic_name && m.generic_name !== m.medicine) ? html`<br><small>${[m.brand_name, m.generic_name !== m.medicine ? m.generic_name : ""].filter(Boolean).join(" · ")}</small>` : ""}
+            ${m.is_active === false ? html` ${badge("Inactive")}` : ""}` },
         { label: "Strength", key: "strength", render: m => m.strength || "—" },
         { label: "Dosage Form", key: "dosage_form", render: m => m.dosage_form || "—" },
         { label: "Usable Stock", key: "current_stock", render: m => number(m.current_stock), className: "num" },
@@ -78,25 +95,30 @@ export async function renderList(ctx) {
     const container = ctx.main.querySelector("#med-table");
     const search = ctx.main.querySelector("#med-search");
     const status = ctx.main.querySelector("#med-status");
+    const active = ctx.main.querySelector("#med-active");
 
     const draw = () => {
         const term = search.value.trim().toLowerCase();
+        const digits = term.replace(/\D/g, "");
         const rows = stock.filter(m =>
-            (!term || [m.medicine, m.strength, m.dosage_form].some(v => (v || "").toLowerCase().includes(term)))
-            && (!status.value || m.status === status.value));
+            (!term || [m.medicine, m.strength, m.dosage_form, m.brand_name, m.generic_name]
+                .some(v => (v || "").toLowerCase().includes(term))
+                || (digits.length >= 8 && m.gtin && m.gtin.endsWith(digits.replace(/^0+/, ""))))
+            && (!status.value || m.status === status.value)
+            && (!active.value || (active.value === "active") === (m.is_active !== false)));
         ctx.main.querySelector("#med-count").textContent = `${rows.length} of ${stock.length}`;
         sortableTable(container, "medicines-table", columns, rows, { empty: "No medicines found." });
     };
     search.addEventListener("input", debounce(draw, 150));
     status.addEventListener("change", draw);
+    active.addEventListener("change", draw);
     draw();
 
     onAction(ctx.main, {
         refresh: () => ctx.reload(),
         add: () => openMedicineForm(null, () => ctx.reload()),
-        edit: async el => {
-            const medicines = await api("/medicines");
-            const medicine = medicines.find(m => m.id === Number(el.dataset.id));
+        edit: el => {
+            const medicine = byId.get(Number(el.dataset.id));
             if (medicine) openMedicineForm(medicine, () => ctx.reload());
         },
     });
@@ -110,7 +132,10 @@ export async function renderDetail(ctx) {
     const reorder = data.reorder;
 
     mount(ctx.main, html`
-        ${pageHeader(`${m.medicine} ${m.strength || ""}`, `${m.dosage_form || "—"} · Medicine detail`, html`
+        ${pageHeader(`${m.medicine} ${m.strength || ""}`,
+            [m.dosage_form || "—", m.brand_name, m.generic_name && m.generic_name !== m.medicine ? `generic: ${m.generic_name}` : "",
+             m.route, m.gtin ? `GTIN ${m.gtin}` : "", m.is_active === false ? "INACTIVE (discontinued)" : ""]
+                .filter(Boolean).join(" · "), html`
             <a class="view-btn" href="#/medicines">← Medicines</a>
             ${ctx.can("medicines.write") ? html`<button type="button" class="refresh-btn" data-action="edit">Edit</button>` : ""}
             ${ctx.can("batches.write") ? html`<button type="button" class="refresh-btn" data-action="add-batch">+ Batch / Opening Stock</button>` : ""}
@@ -118,7 +143,8 @@ export async function renderDetail(ctx) {
 
         <section class="cards">
             <div class="card"><div><span>Usable stock</span><strong>${number(m.usable_stock)}</strong><small class="card-hint">${badge(m.stock_status)}</small></div></div>
-            <div class="card"><div><span>Expired on shelf</span><strong>${number(m.expired_stock)}</strong></div></div>
+            <div class="card"><div><span>Expired on shelf</span><strong>${number(m.expired_stock)}</strong>
+                ${m.held_stock ? html`<small class="card-hint">${number(m.held_stock)} units quarantined / recalled</small>` : ""}</div></div>
             <div class="card"><div><span>Selling price</span><strong>${money(m.selling_price)}</strong></div></div>
             <div class="card"><div><span>Reorder level</span><strong>${number(m.reorder_level)}</strong>
                 <small class="card-hint">${reorder?.reorder_recommended ? `Reorder ${number(reorder.recommended_quantity)} units` : "No reorder needed"}</small></div></div>
@@ -148,7 +174,7 @@ export async function renderDetail(ctx) {
                 { label: "Batch", render: b => html`<a href="#/batches/${b.batch_id}">${b.batch_number}</a>` },
                 { label: "Qty", render: b => number(b.quantity), className: "num" },
                 { label: "Expiry", render: b => formatDate(b.expiry_date) },
-                { label: "Status", render: b => badge(b.status) },
+                { label: "Status", render: b => html`${badge(b.status)} ${b.batch_status !== "ACTIVE" ? badge(b.batch_status) : ""}` },
                 { label: "Location", key: "location" },
                 { label: "Supplier", render: b => b.supplier || "—" },
                 { label: "Unit cost", render: b => money(b.unit_cost), className: "num" },
@@ -182,8 +208,10 @@ export async function renderDetail(ctx) {
 
     const { openBatchForm } = await import("./inventory.js");
     onAction(ctx.main, {
-        edit: () => openMedicineForm({ id: m.medicine_id, name: m.medicine, strength: m.strength,
-            dosage_form: m.dosage_form, reorder_level: m.reorder_level, selling_price: m.selling_price }, () => ctx.reload()),
+        edit: async () => {
+            const medicine = (await api("/medicines")).find(x => x.id === m.medicine_id);
+            if (medicine) openMedicineForm(medicine, () => ctx.reload());
+        },
         "add-batch": () => openBatchForm(m.medicine_id, () => ctx.reload()),
     });
 }

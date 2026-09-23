@@ -102,6 +102,8 @@ const pages = {
     movements: "Stock Movements", purchasing: "Purchasing", suppliers: "Suppliers", analytics: "Analytics",
     reports: "Reports", assistant: "AI Inventory Assistant", notifications: "Notifications", audit: "Audit Trail",
     users: "Users", settings: "Settings", account: "My Account",
+    scan: "Barcode Scan", transfers: "Transfers", reconciliation: "Stock Reconciliation",
+    delivery: "E-mail, SMS & Scheduled Reports", platform: "Platform: Organizations",
 };
 for (const [hash, title] of Object.entries(pages)) {
     await check(`page ${hash} renders`, async () => {
@@ -319,7 +321,8 @@ await check("received stock visible on medicines page", async () => {
 });
 
 await check("analytics tabs render", async () => {
-    for (const tab of ["reorder", "risk", "consumption", "forecast", "turnover", "valuation", "purchasing"]) {
+    for (const tab of ["reorder", "risk", "consumption", "trends", "locations", "stockouts", "forecast", "turnover",
+                       "valuation", "suppliers", "purchasing"]) {
         await go(page, `analytics?tab=${tab}`);
         await page.waitForSelector("#tab-body table");
     }
@@ -355,6 +358,115 @@ await check("assistant answers from data", async () => {
     const fefo = await page.$$eval(".bubble.assistant", b => b[1].innerText);
     expect(fefo.includes("PARA003") && !fefo.includes("PARA004"), fefo);
     await shot(page, "09-assistant");
+});
+
+await check("trends tab draws charts from data", async () => {
+    await go(page, "analytics?tab=trends");
+    await page.waitForSelector(".chart svg rect", { state: "attached" });
+    expect(await page.$$eval(".chart", c => c.length) === 3, "three charts expected");
+    const drawn = await page.$$eval(".chart rect", rects => rects.filter(r => r.getBoundingClientRect().height > 0).length);
+    expect(drawn > 0, "no bars drawn");
+    await shot(page, "07b-analytics-trends");
+});
+
+await check("organization page shows plan and usage", async () => {
+    await go(page, "organization");
+    const text = await page.textContent("#main");
+    expect(text.includes("Enterprise") && text.includes("Users"), "plan/usage missing");
+});
+
+await check("barcode: GTIN on medicine, GS1 scan finds batch and warns FEFO", async () => {
+    await go(page, "medicines/1");
+    await page.click('[data-action="edit"]');
+    await page.fill("#f-gtin", "4006381333931");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector(".modal", { state: "detached" });
+    await go(page, "scan");
+    await page.fill("#scan-code", "(01)04006381333931(10)PARA003");
+    await page.press("#scan-code", "Enter");
+    await page.waitForSelector("#scan-batches");
+    const text = await page.textContent("#scan-result");
+    expect(text.includes("Paracetamol") && text.includes("← scanned") && text.includes("FEFO"), text.slice(0, 300));
+    await shot(page, "11-barcode-scan");
+});
+
+await check("barcode scan at the dispensing counter adds the medicine", async () => {
+    await go(page, "dispense");
+    await page.fill("#c-search", "4006381333931");
+    await page.press("#c-search", "Enter");
+    await page.waitForSelector('table.cart input.qty[data-index="0"]');
+    expect((await page.textContent("#c-cart")).includes("Paracetamol"), "not added by scan");
+    await page.click('[data-action="clear"]');
+});
+
+await check("quarantine and release a batch", async () => {
+    await go(page, "medicines/1");
+    const batchHref = await page.getAttribute("#fefo tbody tr a", "href");
+    await go(page, batchHref.slice(2));
+    await page.click('[data-action="hold"][data-status="QUARANTINED"]');
+    await page.fill("#f-reason", "Seal damaged — E2E");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector("text=excluded from FEFO");
+    await page.click('[data-action="hold"][data-status="ACTIVE"]');
+    await page.fill("#f-reason", "Checked OK");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector('[data-action="hold"][data-status="QUARANTINED"]');
+});
+
+await check("requisition: new ward, request, approve, dispatch, receive", async () => {
+    await go(page, "settings");
+    await page.click('[data-action="add-location"]');
+    await page.fill("#f-name", `Ward E2E ${stamp}`);
+    await page.selectOption("#f-location_type", "WARD");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector(`text=Ward E2E ${stamp}`);
+    await go(page, "transfers");
+    await page.click('[data-action="new"][data-type="REQUISITION"]');
+    await page.selectOption("#t-from", { label: "Main Pharmacy" });
+    await page.selectOption("#t-to", { label: `Ward E2E ${stamp}` });
+    await page.selectOption(".t-med", { label: "Amoxicillin 500 mg Capsule" });
+    await page.fill(".t-qty", "12");
+    await page.click("#transfer-form button[type=submit]");
+    await page.waitForFunction(() => /#\/transfers\/\d+/.test(location.hash));
+    await page.click('[data-action="approve"]');
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector('[data-action="dispatch"]');
+    await page.click('[data-action="dispatch"]');
+    await page.waitForSelector('[data-action="receive"]');
+    await page.click('[data-action="receive"]');
+    await page.waitForFunction(() => document.querySelector(".cards")?.innerText.includes("RECEIVED"));
+    const rec = await page.evaluate(() => fetch("/stock-reconciliation").then(r => r.json()));
+    expect(rec.reconciled, "ledger not reconciled after transfer");
+    await shot(page, "12-requisition");
+});
+
+await check("reconciliation page reports a reconciled ledger", async () => {
+    await go(page, "reconciliation");
+    expect((await page.textContent("#main")).includes("fully reconciled"), "not reconciled");
+});
+
+await check("account: notification preferences and signed-in devices", async () => {
+    await go(page, "account");
+    await page.waitForSelector("#prefs-form");
+    await page.fill("#p-email", "admin@example.com");
+    await page.check("#p-notify-email");
+    await page.click("#prefs-form button[type=submit]");
+    await page.waitForSelector("text=Notification preferences saved.");
+    const devices = await page.textContent("#my-sessions");
+    expect(devices.includes("Web browser") && devices.includes("This device"), devices);
+});
+
+await check("sidebar collapses and expands", async () => {
+    await page.click("#sidebar-collapse");
+    expect(await page.evaluate(() => document.body.classList.contains("sidebar-collapsed")), "not collapsed");
+    await shot(page, "13-collapsed");
+    await page.click("#sidebar-collapse");
+    expect(!(await page.evaluate(() => document.body.classList.contains("sidebar-collapsed"))), "not expanded");
+});
+
+await check("service worker registered for the app shell", async () => {
+    const scope = await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.scope || "");
+    expect(scope.endsWith("/app/"), `scope ${scope}`);
 });
 
 await check("notifications: list and mark all read", async () => {
@@ -431,18 +543,51 @@ await check("viewer sees read-only interface", async () => {
     await viewerPage.waitForSelector("#medicines-table");
     expect(!(await viewerPage.$('[data-action="add"]')), "add button visible to viewer");
     const status = await viewerPage.evaluate(() => fetch("/medicines", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Hack" }),
+        method: "POST", headers: { "Content-Type": "application/json", "X-Requested-With": "PharmaStock" },
+        body: JSON.stringify({ name: "Hack" }),
     }).then(r => r.status));
     expect(status === 403, `viewer POST /medicines -> ${status}`);
+    // Without the application header a cookie request is refused (CSRF guard).
+    const csrf = await viewerPage.evaluate(() => fetch("/notifications/read-all", { method: "POST" })
+        .then(async r => [r.status, (await r.json()).detail]));
+    expect(csrf[0] === 403 && csrf[1].includes("CSRF"), `csrf ${csrf}`);
     await viewerPage.goto(`${BASE}/app/#/users`);
     await viewerPage.waitForSelector("text=You do not have access to this page.");
 });
 
-await check("mobile layout renders without horizontal page scroll", async () => {
+await check("mobile layout: drawer navigation, no horizontal page scroll", async () => {
     await viewerPage.setViewportSize({ width: 390, height: 800 });
+    for (const hash of ["dashboard", "inventory", "medicines", "analytics?tab=trends"]) {
+        await viewerPage.goto(`${BASE}/app/#/${hash}`);
+        await viewerPage.waitForFunction(() => !document.querySelector("#main > .page > .loading"));
+        const overflow = await viewerPage.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+        expect(overflow <= 1, `${hash}: page scrolls horizontally by ${overflow}px`);
+    }
     await viewerPage.goto(`${BASE}/app/#/dashboard`);
     await viewerPage.waitForSelector(".cards .card");
+    expect(await viewerPage.evaluate(() => document.getElementById("sidebar").getBoundingClientRect().right <= 0),
+        "sidebar visible before the menu is opened");
     await shot(viewerPage, "10-mobile");
+    await viewerPage.click("#menu-open");
+    await viewerPage.waitForFunction(() => document.getElementById("sidebar").getBoundingClientRect().left >= 0);
+    await shot(viewerPage, "10b-mobile-drawer");
+    await viewerPage.click('a.nav-item[href="#/medicines"]');
+    await viewerPage.waitForSelector("#medicines-table");
+    expect(!(await viewerPage.evaluate(() => document.body.classList.contains("drawer-open"))), "drawer did not close");
+});
+
+await check("forgot password screen responds without revealing accounts", async () => {
+    const ctx2 = await browser.newContext();
+    const p2 = await ctx2.newPage();
+    watch(p2, "forgot");
+    await p2.goto(`${BASE}/app/`);
+    await p2.click("#show-forgot");
+    await p2.fill("#forgot-username", "nobody-here");
+    await p2.click("#forgot-form button[type=submit]");
+    await p2.waitForSelector("#forgot-message:not([hidden])");
+    expect((await p2.textContent("#forgot-message")).includes("If the account exists"), "no generic message");
+    await shot(p2, "14-forgot-password");
+    await ctx2.close();
 });
 
 await browser.close();

@@ -1,9 +1,12 @@
 /* Stock movement history. (Dispensing lives in dispensing.js.) */
 
-import { api, badge, download, formatDateTime, html, mount, onAction, pageHeader, sortableTable, toast, today } from "../core.js";
-import { signedQuantity } from "./dashboard.js";
+import {
+    api, apiPage, badge, bindPager, download, formatDateTime, html, mount, onAction, pageHeader, pager, signedQuantity,
+    sortableTable, toast, today,
+} from "../core.js";
 
-const TYPES = ["RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT"];
+const TYPES = ["RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT", "TRANSFER_OUT", "TRANSFER_IN"];
+const PAGE_SIZE = 200;
 
 export async function renderMovements(ctx) {
     const medicines = await api("/medicines", { params: { sort: "name" } });
@@ -14,7 +17,7 @@ export async function renderMovements(ctx) {
             ${ctx.can("reports.export") ? html`<button type="button" class="refresh-btn" data-action="export">Export CSV</button>` : ""}`)}
         <section class="section">
             <div class="toolbar">
-                <select id="mv-type" aria-label="Movement type"><option value="">All types</option>${TYPES.map(t => html`<option>${t}</option>`)}</select>
+                <select id="mv-type" aria-label="Movement type"><option value="">All types</option>${TYPES.map(t => html`<option value="${t}">${t.replace("_", " ").toLowerCase()}</option>`)}</select>
                 <select id="mv-medicine" aria-label="Medicine"><option value="">All medicines</option>
                     ${medicines.map(m => html`<option value="${m.id}">${m.name} ${m.strength || ""}</option>`)}</select>
                 <label>From <input type="date" id="mv-from" value="${today(-90)}"></label>
@@ -40,13 +43,20 @@ export async function renderMovements(ctx) {
         { label: "Reason", key: "reason", render: m => m.reason || "—" },
         { label: "User", key: "user_name", render: m => m.user_name || "—" },
     ];
-    const load = async () => {
-        const rows = await api("/stock-movements", { params: { ...filters(), limit: 2000 } });
-        ctx.main.querySelector("#mv-count").textContent = `${rows.length} movements`;
-        sortableTable(ctx.main.querySelector("#mv-table"), "movements-table", columns, rows, { empty: "No movements in this period." });
+    const load = async (page = 0) => {
+        const { rows, total } = await apiPage("/stock-movements", filters(), page, PAGE_SIZE);
+        if (!ctx.isCurrent()) return;
+        ctx.main.querySelector("#mv-count").textContent = `${total.toLocaleString()} movements`;
+        sortableTable(ctx.main.querySelector("#mv-table"), "movements-table", columns, rows, {
+            empty: "No movements in this period.",
+            afterRender: c => {
+                c.insertAdjacentHTML("beforeend", String(pager("mv-pager", total, page, PAGE_SIZE)));
+                bindPager(c, "mv-pager", load);
+            },
+        });
     };
-    ctx.main.querySelectorAll(".toolbar select, .toolbar input").forEach(el => el.addEventListener("change", load));
-    await load();
+    ctx.main.querySelectorAll(".toolbar select, .toolbar input").forEach(el => el.addEventListener("change", () => load(0)));
+    await load(0);
 
     onAction(ctx.main, {
         export: () => {

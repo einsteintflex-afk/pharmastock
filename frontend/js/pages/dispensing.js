@@ -103,7 +103,7 @@ export async function renderCounter(ctx) {
         <div class="counter-grid">
             <section class="section">
                 <div class="section-header"><div><h3>1. Find medicine</h3><p>Only medicines with usable (non-expired) stock are listed</p></div></div>
-                <div class="toolbar"><input type="search" id="c-search" placeholder="Type a medicine name…" aria-label="Search medicines" autocomplete="off"></div>
+                <div class="toolbar"><input type="search" id="c-search" placeholder="Type a medicine name or scan a barcode…" aria-label="Search medicines or scan a barcode" autocomplete="off"></div>
                 <ul class="pick-list" id="c-results"></ul>
             </section>
 
@@ -240,7 +240,27 @@ export async function renderCounter(ctx) {
     }));
     form.elements.location_id?.addEventListener("change", async () => { await Promise.all(cart.map(refreshPlan)); cart.forEach(updateRow); });
     search.addEventListener("input", debounce(drawResults, 120));
-    search.addEventListener("keydown", event => {
+    // A scanner types the code and presses Enter: GS1 codes and EAN/GTIN
+    // numbers are looked up by barcode instead of by name.
+    const looksLikeBarcode = text => /^\d{8,14}$/.test(text) || /^\(01\)/.test(text) || /^(\]d2)?01\d{14}/.test(text) || text.includes("\x1d");
+    search.addEventListener("keydown", async event => {
+        if (event.key === "Enter" && looksLikeBarcode(search.value.trim())) {
+            event.preventDefault();
+            const code = search.value.trim();
+            try {
+                const { lookup } = await import("./scan.js");
+                const result = await lookup(code, locationValue() ? Number(locationValue()) : null);
+                result.warnings.forEach(w => toast(w, "warning"));
+                if (result.medicine) {
+                    if (result.matched_batch && result.matched_batch.batch_status !== "ACTIVE") return;
+                    await addLine(result.medicine.id);
+                }
+                search.value = "";
+            } catch (error) {
+                toast(error.message, "error");
+            }
+            return;
+        }
         if (event.key === "Enter") {
             event.preventDefault();
             drawResults();  // apply the current text now, not after the debounce

@@ -237,8 +237,9 @@ async def request_context(request: Request, call_next):
 
     try:
         response = _guard(request) or await call_next(request)
-    finally:
+    except BaseException:
         observability.request_id_var.reset(token)
+        raise
 
     elapsed = time.perf_counter() - started
     route = request.scope.get("route")
@@ -250,18 +251,21 @@ async def request_context(request: Request, call_next):
         request.method, request.url.path, response.status_code, elapsed * 1000,
         user.username if user else "-", request_id,
     )
+    observability.request_id_var.reset(token)
 
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.url.path.startswith("/app"):
+        # The camera is used only for barcode scanning, and only by this origin.
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
             "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         )
     else:
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Cache-Control"] = "no-store"
     if settings.cookie_secure:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"

@@ -2,48 +2,91 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>PharmaStock</title>
+    <meta name="description" content="PharmaStock pharmacy inventory management: stock, expiry, FEFO, dispensing and purchasing">
+    <meta name="theme-color" content="#0d3b66">
+    <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+    <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+    <link rel="manifest" href="manifest.json">
     <link rel="stylesheet" href="style.css">
     <script type="module" src="js/app.js"></script>
 </head>
 
 <body>
 
-    <!-- SIGN IN -->
+    <!-- SIGN IN / PASSWORD RESET -->
     <main id="login" class="login-screen" hidden>
-        <form id="login-form" class="login-card" autocomplete="on">
-            <div class="brand login-brand">
-                <div class="brand-icon" aria-hidden="true">P</div>
-                <div>
-                    <h1>PharmaStock</h1>
-                    <span>Inventory Intelligence</span>
+        <div class="login-card">
+            <img class="login-logo" src="assets/logo.webp" width="220" height="220"
+                 alt="PharmaStock 2.0 — Pharmacy Inventory Management System">
+
+            <form id="login-form" autocomplete="on">
+                <h2>Sign in</h2>
+                <div class="field">
+                    <label for="login-username">Username</label>
+                    <input id="login-username" name="username" autocomplete="username" required maxlength="50">
                 </div>
-            </div>
-            <h2>Sign in</h2>
-            <div class="field">
-                <label for="login-username">Username</label>
-                <input id="login-username" name="username" autocomplete="username" required maxlength="50">
-            </div>
-            <div class="field">
-                <label for="login-password">Password</label>
-                <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="200">
-            </div>
-            <div id="login-error" class="form-error" role="alert" hidden></div>
-            <button type="submit" class="refresh-btn primary">Sign in</button>
-        </form>
+                <div class="field">
+                    <label for="login-password">Password</label>
+                    <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="200">
+                </div>
+                <div id="login-error" class="form-error" role="alert" hidden></div>
+                <button type="submit" class="refresh-btn primary">Sign in</button>
+                <button type="button" class="link-btn" id="show-forgot">Forgot your password?</button>
+            </form>
+
+            <form id="forgot-form" hidden>
+                <h2>Reset your password</h2>
+                <p class="form-intro">Enter your username. If your account has an e-mail address, a one-time reset link is sent to it.
+                    Otherwise ask your administrator.</p>
+                <div class="field">
+                    <label for="forgot-username">Username</label>
+                    <input id="forgot-username" name="username" autocomplete="username" required maxlength="50">
+                </div>
+                <div id="forgot-message" class="form-intro" role="status" hidden></div>
+                <button type="submit" class="refresh-btn primary">Send reset link</button>
+                <button type="button" class="link-btn" data-back-to-login>Back to sign in</button>
+            </form>
+
+            <form id="reset-form" hidden>
+                <h2>Choose a new password</h2>
+                <div class="field">
+                    <label for="reset-password">New password</label>
+                    <input id="reset-password" name="password" type="password" autocomplete="new-password" required maxlength="200">
+                    <small class="help">At least 10 characters, with letters and numbers, not containing your username.</small>
+                </div>
+                <div class="field">
+                    <label for="reset-repeat">Repeat new password</label>
+                    <input id="reset-repeat" name="repeat" type="password" autocomplete="new-password" required maxlength="200">
+                </div>
+                <div id="reset-error" class="form-error" role="alert" hidden></div>
+                <button type="submit" class="refresh-btn primary">Set password</button>
+                <button type="button" class="link-btn" data-back-to-login>Back to sign in</button>
+            </form>
+        </div>
     </main>
 
     <!-- APPLICATION -->
     <div id="app" class="app" hidden>
 
-        <aside class="sidebar">
+        <header class="mobile-bar">
+            <button type="button" class="icon-btn menu-btn" id="menu-open" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">☰</button>
+            <a class="mobile-brand" href="#/">
+                <img src="assets/mark-64.png" width="32" height="32" alt=""><span>PharmaStock</span>
+            </a>
+            <a class="icon-btn" href="#/notifications" aria-label="Notifications">🔔<em class="nav-count" id="mobile-unread" hidden></em></a>
+        </header>
+        <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+
+        <aside class="sidebar" id="sidebar">
             <div class="brand">
-                <div class="brand-icon" aria-hidden="true">P</div>
+                <img class="brand-mark" src="assets/mark-64.png" width="42" height="42" alt="">
                 <div>
                     <h1>PharmaStock</h1>
-                    <span>Inventory Intelligence</span>
+                    <span id="brand-org">Inventory Intelligence</span>
                 </div>
+                <button type="button" class="icon-btn collapse-btn" id="sidebar-collapse" aria-label="Collapse menu" title="Collapse menu">«</button>
             </div>
 
             <nav id="nav-main" aria-label="Main"></nav>
