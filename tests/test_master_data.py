@@ -204,3 +204,29 @@ def test_supplier_receipt_history(api, product):
     assert {"CREATE", "RECEIVE"} <= {a["action"] for a in detail["activity"]}
     batch = api.get(f"/batches/{received.json()['batch_id']}").json()["batch"]
     assert batch["purchase_date"] is not None and batch["barcode_data"] == "0104006381333931"
+
+
+# ---------------------------------------------------------------- barcode lookup
+
+def test_barcode_lookup(api, product):
+    batch = api.post("/batches", {"medicine_id": product["id"], "batch_number": "SCAN-7", "quantity": 9,
+                                  "expiry_date": _day(700)}).json()
+    code = f"0104006381333931" + "17" + (date.today() + timedelta(days=700)).strftime("%y%m%d") + "10SCAN-7"
+    result = api.post("/barcode/lookup", {"code": code}, role="PHARMACY_TECHNICIAN").json()
+    assert result["medicine"]["id"] == product["id"]
+    assert result["matched_batch"]["batch_id"] == batch["id"]
+    # An earlier-expiring batch of this medicine exists, so FEFO warns.
+    assert any("FEFO" in w for w in result["warnings"])
+    assert result["fefo_batch"]["batch_id"] != batch["id"]
+
+    wrong_expiry = api.post("/barcode/lookup", {"code": "(01)04006381333931(17)300101(10)SCAN-7"}).json()
+    assert any("differs from the recorded expiry" in w for w in wrong_expiry["warnings"])
+    unknown_lot = api.post("/barcode/lookup", {"code": "(01)04006381333931(10)NEW-LOT"}).json()
+    assert unknown_lot["matched_batch"] is None and any("not on record" in w for w in unknown_lot["warnings"])
+    plain = api.post("/barcode/lookup", {"code": "4006381333931"}).json()
+    assert plain["medicine"]["id"] == product["id"] and plain["matched_batch"] is None
+    unknown = api.post("/barcode/lookup", {"code": "96385074"}).json()
+    assert unknown["medicine"] is None and unknown["warnings"]
+    assert api.post("/barcode/lookup", {"code": "garbage!"}).status_code == 400
+    parsed = api.post("/barcode/parse", {"code": "(01)04006381333931(21)ABC"}).json()
+    assert parsed["serial_number"] == "ABC"

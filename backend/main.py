@@ -23,7 +23,7 @@ from . import database
 from .config import settings
 from .migrate import pending_migrations
 from .routers import (
-    admin, analytics, assistant, auth, dispensing, inventory, medicines, organizations, purchasing, reports, stock,
+    admin, analytics, assistant, auth, barcode, dispensing, inventory, medicines, organizations, purchasing, reports, stock,
     suppliers, transfers, users,
 )
 from .services import notifications
@@ -271,7 +271,7 @@ def health():
         return JSONResponse(status_code=503, content={"status": "error", "database": "unavailable"})
 
 
-for module in (auth, users, organizations, medicines, inventory, stock, dispensing, transfers, suppliers, purchasing,
+for module in (auth, users, organizations, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,
                analytics, reports, admin, assistant):
     app.include_router(module.router)
 
