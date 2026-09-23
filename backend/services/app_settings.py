@@ -19,6 +19,7 @@ SETTING_RULES = {
     "pharmacy.name": (str, 1, 150),
     "pharmacy.address": (str, 0, 255),
     "pharmacy.phone": (str, 0, 50),
+    "transfers.separate_approver": (bool, None, None),
 }
 
 
@@ -35,6 +36,8 @@ DEFAULTS = {
     "pharmacy.name": ("PharmaStock Pharmacy", "Pharmacy name printed on receipts"),
     "pharmacy.address": ("", "Address printed on receipts"),
     "pharmacy.phone": ("", "Phone number printed on receipts"),
+    "transfers.separate_approver": (False, "Transfers and requisitions must be approved by someone other "
+                                           "than the requester"),
 }
 
 
@@ -91,7 +94,10 @@ def validate(changes: dict, current: dict) -> dict:
         if key not in SETTING_RULES:
             raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
         kind, low, high = SETTING_RULES[key]
-        if kind is int:
+        if kind is bool:
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+        elif kind is int:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise HTTPException(status_code=400, detail=f"{key} must be a whole number")
             if not low <= value <= high:

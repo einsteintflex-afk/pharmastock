@@ -40,7 +40,8 @@ def run_report(
     location_id: int | None = None,
     supplier_id: int | None = None,
     status: Literal["EXPIRED", "CRITICAL", "URGENT", "APPROACHING EXPIRY", "NORMAL"] | None = None,
-    movement_type: Literal["RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT"] | None = None,
+    movement_type: Literal["RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT",
+                           "TRANSFER_OUT", "TRANSFER_IN"] | None = None,
     user: CurrentUser = Depends(require("analytics.read")),
     conn: psycopg.Connection = Depends(get_db),
 ):

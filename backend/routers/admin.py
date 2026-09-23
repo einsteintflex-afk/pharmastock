@@ -62,7 +62,7 @@ def mark_all_read(user: CurrentUser = Depends(require("notifications.read")),
         """
         INSERT INTO notification_reads (notification_id, user_id)
         SELECT id, %s FROM notifications
-        WHERE resolved_at IS NULL OR category IN ('PURCHASING', 'RECEIVING')
+        WHERE resolved_at IS NULL OR category IN ('PURCHASING', 'RECEIVING', 'TRANSFERS')
         ON CONFLICT DO NOTHING
         """,
         (user.id,),

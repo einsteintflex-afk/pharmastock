@@ -11,7 +11,7 @@ from datetime import date
 
 import psycopg
 
-from . import app_settings, expiry, inventory
+from . import app_settings, expiry, inventory, stock
 
 
 def _settings(conn):
@@ -331,10 +331,9 @@ def turnover(conn: psycopg.Connection) -> list[dict]:
         """
     ).fetchall()
     changes = conn.execute(
-        """
+        f"""
         SELECT batches.medicine_id,
-               COALESCE(SUM(CASE WHEN sm.movement_type IN ('RECEIVED','RETURNED','ADJUSTMENT')
-                                 THEN sm.quantity ELSE -sm.quantity END), 0)::int AS net_change_90d,
+               COALESCE(SUM({stock.signed_quantity_sql('sm')}), 0)::int AS net_change_90d,
                COALESCE(SUM(sm.quantity) FILTER (WHERE sm.movement_type = 'DISPENSED'), 0)::int AS dispensed_90d
         FROM stock_movements sm
         JOIN batches ON batches.id = sm.batch_id

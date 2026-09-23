@@ -5,8 +5,8 @@
 # caller's transaction, with the batch row locked (SELECT ... FOR UPDATE).
 # Each change writes exactly one stock_movements row, so that for every batch:
 #
-#   batches.quantity = SUM(RECEIVED + RETURNED + ADJUSTMENT)
-#                    - SUM(DISPENSED + DAMAGED + EXPIRED)
+#   batches.quantity = SUM(RECEIVED + RETURNED + ADJUSTMENT + TRANSFER_IN)
+#                    - SUM(DISPENSED + DAMAGED + EXPIRED + TRANSFER_OUT)
 #
 # (reconciliation() verifies this).
 #
@@ -24,7 +24,13 @@ from ..security import CurrentUser
 
 INBOUND = ("RECEIVED", "RETURNED")
 OUTBOUND = ("DISPENSED", "DAMAGED", "EXPIRED")
+# Types that can be recorded directly (POST /stock-movements).
 MOVEMENT_TYPES = ("RECEIVED", "DISPENSED", "RETURNED", "DAMAGED", "EXPIRED", "ADJUSTMENT")
+# Written only by the transfer workflow.
+TRANSFER_TYPES = ("TRANSFER_OUT", "TRANSFER_IN")
+ALL_MOVEMENT_TYPES = MOVEMENT_TYPES + TRANSFER_TYPES
+# Stored quantity adds to the batch (ADJUSTMENT stores a signed change).
+POSITIVE_TYPES = ("RECEIVED", "RETURNED", "ADJUSTMENT", "TRANSFER_IN")
 
 # Permission needed to record each movement type.
 MOVEMENT_PERMISSIONS = {
@@ -36,14 +42,19 @@ MOVEMENT_PERMISSIONS = {
     "ADJUSTMENT": "stock.adjust",
 }
 
-LEDGER_SUM_SQL = """
-    COALESCE(SUM(
-        CASE
-            WHEN sm.movement_type IN ('RECEIVED', 'RETURNED', 'ADJUSTMENT') THEN sm.quantity
-            ELSE -sm.quantity
-        END
-    ), 0)
-"""
+
+
+def signed_quantity_sql(alias: str = "sm") -> str:
+    """SQL expression: a movement's effect on its batch quantity."""
+    positive = ", ".join(f"'{t}'" for t in POSITIVE_TYPES)
+    return f"CASE WHEN {alias}.movement_type IN ({positive}) THEN {alias}.quantity ELSE -{alias}.quantity END"
+
+
+def signed_quantity(movement_type: str, quantity: int) -> int:
+    return quantity if movement_type in POSITIVE_TYPES else -quantity
+
+
+LEDGER_SUM_SQL = f"COALESCE(SUM({signed_quantity_sql('sm')}), 0)"
 
 
 def _lock_batch(conn: psycopg.Connection, batch_id: int) -> dict:
@@ -72,14 +83,17 @@ def insert_movement(
     reason: str | None,
     user: CurrentUser | None,
     dispensation_item_id: int | None = None,
+    transfer_id: int | None = None,
 ) -> dict:
     return conn.execute(
         """
-        INSERT INTO stock_movements (batch_id, movement_type, quantity, reason, user_id, dispensation_item_id)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO stock_movements (batch_id, movement_type, quantity, reason, user_id, dispensation_item_id,
+                                     transfer_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id, batch_id, movement_type, quantity, movement_date, reason
         """,
-        (batch_id, movement_type, quantity, reason, user.id if user else None, dispensation_item_id),
+        (batch_id, movement_type, quantity, reason, user.id if user else None, dispensation_item_id,
+         transfer_id),
     ).fetchone()
 
 
@@ -238,6 +252,9 @@ def record_movement(
     movement_type = movement_type.upper().strip()
     reason = (reason or "").strip() or None
 
+    if movement_type in TRANSFER_TYPES:
+        raise HTTPException(status_code=400,
+                            detail="Transfer movements are recorded through the transfer workflow (/transfers)")
     if movement_type not in MOVEMENT_TYPES:
         raise HTTPException(
             status_code=400,

@@ -136,6 +136,30 @@ def event(
     )
 
 
+def open_item(
+    conn: psycopg.Connection,
+    *,
+    category: str,
+    severity: str,
+    title: str,
+    message: str,
+    entity_type: str,
+    entity_id,
+    key: str,
+) -> None:
+    """A notification that needs someone to act (for example a transfer
+    awaiting approval). It stays open until resolve() is called."""
+    _upsert(conn, key=key, category=category, severity=severity, title=title, message=message,
+            entity_type=entity_type, entity_id=entity_id)
+
+
+def resolve(conn: psycopg.Connection, key: str) -> None:
+    conn.execute(
+        "UPDATE notifications SET resolved_at = CURRENT_TIMESTAMP WHERE dedupe_key = %s AND resolved_at IS NULL",
+        (key,),
+    )
+
+
 def list_for_user(conn, user_id: int, *, include_resolved: bool, unread_only: bool, limit: int) -> list[dict]:
     return conn.execute(
         """
@@ -144,9 +168,9 @@ def list_for_user(conn, user_id: int, *, include_resolved: bool, unread_only: bo
                (r.read_at IS NOT NULL) AS is_read
         FROM notifications n
         LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = %(user_id)s
-        WHERE (%(include_resolved)s OR n.resolved_at IS NULL OR n.category IN ('PURCHASING', 'RECEIVING'))
+        WHERE (%(include_resolved)s OR n.resolved_at IS NULL OR n.category IN ('PURCHASING', 'RECEIVING', 'TRANSFERS'))
           AND (NOT %(unread_only)s OR r.read_at IS NULL)
-          AND (n.category NOT IN ('PURCHASING', 'RECEIVING') OR n.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days')
+          AND (n.category NOT IN ('PURCHASING', 'RECEIVING', 'TRANSFERS') OR n.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days')
         ORDER BY (r.read_at IS NULL) DESC,
                  CASE n.severity WHEN 'CRITICAL' THEN 0 WHEN 'WARNING' THEN 1 ELSE 2 END,
                  n.updated_at DESC
@@ -164,7 +188,7 @@ def unread_count(conn, user_id: int) -> int:
         LEFT JOIN notification_reads r ON r.notification_id = n.id AND r.user_id = %s
         WHERE r.read_at IS NULL
           AND (n.resolved_at IS NULL
-               OR (n.category IN ('PURCHASING', 'RECEIVING')
+               OR (n.category IN ('PURCHASING', 'RECEIVING', 'TRANSFERS')
                    AND n.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days'))
         """,
         (user_id,),

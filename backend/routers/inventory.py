@@ -204,8 +204,7 @@ def batch_detail(batch_id: int, user: CurrentUser = Depends(require("inventory.r
 
     balance = 0
     for movement in history:
-        sign = 1 if movement["movement_type"] in ("RECEIVED", "RETURNED", "ADJUSTMENT") else -1
-        balance += sign * movement["quantity"]
+        balance += stock.signed_quantity(movement["movement_type"], movement["quantity"])
         movement["balance_after"] = balance
 
     receipts = conn.execute(
