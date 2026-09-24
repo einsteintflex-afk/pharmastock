@@ -167,7 +167,7 @@ report); report views and exports are audited; the audit report needs `audit.rea
 suppliers, overstock, expired stock, stock-outs, locations, open transfers; forecast now
 includes sufficiency). Claude (tool loop with server-side fallback) when a key is set;
 otherwise a deterministic engine that answers the same questions from the same data.
-Every question is audited. The system prompt forbids inventing figures, treats tool
+Verified live against the Claude API on the project data (FEFO / expired stock, monthly summary with reorder, stock value — correct figures and currency). Every question is audited. The system prompt forbids inventing figures, treats tool
 output as data, and states it is inventory decision support, not clinical advice.
 Tested questions include "summary of this month", "how has stock changed this month",
 "top suppliers", "high stock but low consumption", "value of expired stock", "stock-outs".
@@ -267,7 +267,7 @@ function declarations; every named import resolves.
 ## 20. Known limitations
 
 See LIMITATIONS.md — notably: tested on PostgreSQL 16 / Linux (not yet on your PG18 /
-Windows machine), Claude path tested with a mock, no provider-specific SMS adapter,
+Windows machine), no provider-specific SMS adapter,
 transfers received all-or-nothing, no billing-provider integration, CI not yet run on
 GitHub, camera scanning depends on browser support.
 

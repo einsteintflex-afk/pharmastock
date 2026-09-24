@@ -145,7 +145,7 @@ def tool_fefo(conn, medicine_name: str, quantity: int | None = None, **_):
             ),
             "note": "Expired batches are excluded; they must not be dispensed.",
         })
-    return {"medicines": results}
+    return {"medicines": results, "currency": app_settings.get(conn, "currency.symbol")}
 
 
 def tool_valuation(conn, **_):
@@ -173,7 +173,7 @@ def tool_medicine_stock(conn, medicine_name: str, **_):
                               "reorder_level", "stock_status", "next_expiry", "stock_value"]),
             "batches": [_pick(b, ["batch_number", "quantity", "expiry_date", "status", "location"]) for b in batches],
         })
-    return {"medicines": out}
+    return {"medicines": out, "currency": app_settings.get(conn, "currency.symbol")}
 
 
 def tool_forecast(conn, horizon_days: int = 30, **_):
