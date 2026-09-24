@@ -13,7 +13,7 @@ from .. import idempotency
 from ..database import get_db
 from ..schemas import Email, LongText, Name150, Phone, Text255, blank_to_none
 from ..security import CurrentUser, require
-from ..services import dispensing
+from ..services import dispensing, messaging
 
 router = APIRouter(tags=["Dispensing"])
 
@@ -67,6 +67,9 @@ def create_dispensation(body: DispensationCreate, request: Request,
     for item in data["items"]:
         item["directions"] = blank_to_none(item["directions"])
     result = dispensing.create(conn, user, data)
+    from .branding import receipt_url
+    result["messages_queued"] = messaging.queue_receipt_messages(
+        conn, user.organization_id, result, receipt_url(request, result["receipt_token"]))
     idempotency.finish(conn, request, result, 201)
     conn.commit()
     return result
