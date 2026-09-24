@@ -17,8 +17,8 @@ What starts:
 
 | Service | Image | Role |
 |---|---|---|
-| `db` | postgres:16 | Database. On first start `deploy/postgres-init.sh` creates `pharmastock_app` (owner, no superuser/BYPASSRLS) and `pharmastock_backup` (read-only, BYPASSRLS). Not exposed outside the Docker network. |
-| `app` | built from `Dockerfile` | Applies migrations, then serves the API and web app (2 workers, JSON logs, production mode). |
+| `db` | postgres:16 | Database. On first start `deploy/postgres-init.sh` creates three roles: `pharmastock_owner` (owns the schema, migrations only), `pharmastock_app` (the application: row privileges only, no superuser / BYPASSRLS) and `pharmastock_backup` (read-only, BYPASSRLS). Not exposed outside the Docker network. |
+| `app` | built from `Dockerfile` | Applies migrations as the owner (`MIGRATION_DATABASE_URL`), grants the application role (`APP_DB_ROLE`), then serves the API and web app as `pharmastock_app` (2 workers, JSON logs, production mode). |
 | `proxy` | caddy:2 | HTTPS with automatic Let's Encrypt certificates for `DOMAIN`, HTTP→HTTPS redirect, gzip. |
 | `backup` | postgres:16 | Dump every `BACKUP_INTERVAL_HOURS` into `BACKUP_HOST_DIR`, keeps `BACKUP_RETENTION_DAYS`. |
 
@@ -46,11 +46,32 @@ python -m backend.migrate status; python -m backend.migrate               # 3. s
 uvicorn backend.main:app --host 127.0.0.1 --port 8000                     # 4. run
 ```
 
-Row level security only protects organizations from each other when the application
-connects as a non-superuser role. For a single-pharmacy installation the development
-setup works (a warning is logged); before adding a second organization or setting
-`PHARMASTOCK_ENV=production`, run `deploy/create_app_role.sql` as `postgres` and point
-`DATABASE_URL` at `pharmastock_app`.
+Add to `.env` before starting the upgraded version:
+
+```
+SECRET_KEY=<48+ random characters: python -c "import secrets; print(secrets.token_urlsafe(48))">
+```
+
+Keep a copy of `SECRET_KEY` with the backups: without it, stored two-step verification
+secrets and messaging credentials cannot be decrypted (users would need an MFA reset).
+
+**Least-privilege roles (before adding a second organization or going to production).**
+Row level security protects organizations from each other only when the application
+connects as a restricted role:
+
+```powershell
+psql -U postgres -d pharmastock -v app_password='<strong password>' -f deploy\create_app_role.sql
+# .env
+MIGRATION_DATABASE_URL=postgresql://postgres:<pw>@localhost/pharmastock   # the current owner
+APP_DB_ROLE=pharmastock_app
+DATABASE_URL=postgresql://pharmastock_app:<strong password>@localhost/pharmastock
+python -m backend.migrate            # grants pharmastock_app its privileges
+```
+
+Using a dedicated non-superuser owner role instead of `postgres` for
+`MIGRATION_DATABASE_URL` is better still: `ALTER DATABASE pharmastock OWNER TO …` and
+`ALTER TABLE … OWNER TO …` for every table (the loop in the old create_app_role.sql
+shows how).
 
 For access from other computers put IIS / nginx / Caddy with a certificate in front and
 set `PHARMASTOCK_ENV=production` (secure cookies, HSTS, no `/docs`).
@@ -61,7 +82,12 @@ See `.env.example` for every variable with comments. Essentials:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection (application role) |
+| `DATABASE_URL` | PostgreSQL connection (restricted application role) |
+| `MIGRATION_DATABASE_URL`, `APP_DB_ROLE` | Schema-owner connection for migrations; application role to grant after migrating |
+| `SECRET_KEY` | Encrypts stored secrets (MFA, provider credentials); **required** in production |
+| `PLATFORM_SESSION_HOURS`, `STEP_UP_MINUTES` | Platform administrator session length and step-up window |
+| `WHATSAPP_*` | MedCart Tech's WhatsApp Business Platform number (Cloud API): phone number id, access token, app secret, verify token, receipt template |
+| `PAYMENT_PROVIDER`, `PAYSTACK_SECRET_KEY` | `manual` (confirmed in the console) or `paystack` (verified webhooks) |
 | `PHARMASTOCK_ENV` | `production` enables secure cookies, HSTS, disables `/docs`, refuses superuser DB roles |
 | `APP_BASE_URL` | Public URL used in e-mailed links |
 | `SMTP_*`, `SMS_*` | E-mail and SMS delivery (optional) |
@@ -70,6 +96,17 @@ See `.env.example` for every variable with comments. Essentials:
 | `ERROR_WEBHOOK_URL` / `SENTRY_DSN` | Unhandled-error reporting |
 | `METRICS_TOKEN` | Protects `/metrics` |
 | `RATE_LIMIT_*` | Sign-in and API rate limits |
+
+## External services (set up by MedCart Tech)
+
+| Service | What to do | Webhook URL |
+|---|---|---|
+| WhatsApp Business Platform | Meta Business account → WhatsApp → phone number; create and get approval for the template `pharmastock_receipt` (body with 4 parameters: customer name, company name, total, receipt link) and optionally a thank-you template; permanent system-user access token | `https://DOMAIN/messaging/webhooks/whatsapp` (verify token = `WHATSAPP_VERIFY_TOKEN`; subscribe to `messages`) |
+| Paystack | Secret key in `PAYSTACK_SECRET_KEY`, `PAYMENT_PROVIDER=paystack` | `https://DOMAIN/billing/webhooks/paystack` |
+| SMS gateway | Any gateway accepting `{"to","message"}` JSON with a bearer token (`SMS_WEBHOOK_URL`) | — |
+| SMTP | Any SMTP account (`SMTP_*`) | — |
+
+Prices of plans and credit packages are set in the MedCart console (Plans / Payments & credits); nothing is sold until a price is set.
 
 ## Monitoring
 

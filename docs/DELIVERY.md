@@ -1,4 +1,121 @@
-# PharmaStock 2.0 — Full Product Delivery Report
+# PharmaStock — MedCart Tech Release Candidate: Delivery Report
+
+Branch `claude/bold-goldberg-p2dvu3`. Nothing is merged into `main` and there is no pull
+request. **Powered by MedCart Tech.** Every figure below was produced by running the code in
+this environment on 24 September 2026.
+
+**Result in one line:** the existing 2.0 system was extended, not rebuilt, into a
+MedCart Tech SaaS release candidate:
+
+- 2 additive migrations (0013, 0014) that keep every existing record;
+- 186 permission-checked API endpoints (generated list in API.md);
+- **293 passing backend tests**, with the API running as a restricted non-owner database role;
+- **81 / 81 browser checks with 0 browser errors**;
+- a measured benchmark up to 1,000 organizations.
+
+It is a release candidate for review. It is not yet a production release: some items need
+live accounts or the real server, and they are listed in §6.
+
+## 1. Audit first
+
+`docs/GAP_ANALYSIS.md` records the audit made before any change. It covers:
+
+- what already worked, what was partial and what was missing;
+- the defects found, and the security, database, UI, SaaS, messaging, platform-owner,
+  scalability and production gaps;
+- the implementation order.
+
+## 2. What was added (by area)
+
+| Area | Delivered | Where verified |
+|---|---|---|
+| **Security core** | TOTP two-step verification (secret encrypted, replay-safe, hashed recovery codes, sign-in challenge, lockout); organizations can require MFA for owners / admins; admin MFA reset | test_platform_security (24 tests), E2E set-up + sign-in with recovery code |
+| **Platform owner** | MFA-verified short privileged sessions; step-up for high-risk actions; separate append-only **platform audit**; **security monitor** (failed sign-ins / codes, 403s, cross-tenant id probes, rate limits, top IPs, repeated probes, unusual adjustments per organization); **recovery access** (1 h, single use, one chosen admin, mandatory reason, visible in the organization's own audit). **No master password, no impersonation** | test_platform_security |
+| **Roles** | Owner, Inventory Officer, Purchasing Officer, Cashier, Auditor added (11 roles); only an owner manages the owner role; new permissions `stock.count`, `stock.approve`, `purchasing.approve`, `billing.manage`, `communications.manage` | role tests |
+| **Least privilege** | Migrations as schema owner (`MIGRATION_DATABASE_URL`); API as a restricted role (`APP_DB_ROLE`), which cannot alter the schema or rewrite audit trails; Docker init creates owner / app / backup roles; **tests run the API as such a role** | test_application_role_has_least_privilege + whole suite |
+| **Idempotency** | `Idempotency-Key` on sales, receipts, stock movements, adjustments, count posting, transfer dispatch / receipt | tests + counter / receipt UI send keys |
+| **Plans & SaaS** | Plan catalogue in the database, editable in the console; different Basic / Professional / Enterprise features; limits for users, locations, medicines and scheduled reports enforced on the API; per-organization overrides; subscriptions; payment providers (manual confirmation, Paystack signed webhooks, exact amount match, replay-safe); messaging packages and credit ledger; trial / period end flagged | test_billing_plans (9) |
+| **Stock control** | Adjustments with 11 reason codes, before / change / after, device, request id, approval thresholds (another person approves; deltas applied); all manual movements recorded as adjustments; stock counts (snapshot per line, variance by quantity and value, uncounted list, submit / reopen / post) | test_stock_control, E2E count + adjustment |
+| **Purchasing** | Approval workflow (submit, approve by another user, reject, mark sent); expected delivery, overdue; PO from reorder list with last price paid; price history | tests, E2E |
+| **Receipts & branding** | Discount (amount / %), configurable tax, company details and logo (validated, re-encoded), A4 and 80 mm thermal PDF, expiring digital receipt link with strict CSP, branded PDF reports, "Powered by MedCart Tech" | tests, E2E thermal PDF + logo |
+| **Messaging** | Provider-independent gateway: e-mail, SMS, **WhatsApp Business Platform (Cloud API, templates only)**; explicit mode (off / MedCart credits / own accounts); consent per number and channel, re-checked at send time, STOP opt-out; signed webhooks for delivery status; credits charged once and refunded when not delivered; own credentials encrypted and masked; SSRF protection for own SMS / SMTP hosts | test_messaging (11) |
+| **Intelligence** | Safety stock and reorder point; attention list; daily brief; fast / slow / dead movers; stock-out risk counting only deliveries due in time; global search (role-limited); 4 new reports (26 total) | test_intelligence (12) |
+| **AI** | New tools: medicine history, stock-out risk this week, outstanding supplier orders, today's priorities, unusual adjustments. The assistant only receives the tools the user's role and plan allow | tests |
+| **Onboarding** | 9-step set-up guide ticked from real data; new organizations start there | tests, E2E |
+| **UI** | Grouped, collapsible navigation; command center (quick actions, attention, brief); Scan Center with 6 modes and "PRODUCT NOT FOUND → create medicine" (reviewed before saving, no external data trusted); new pages for stock counts, adjustments, reorder, billing, messaging, MFA and the MedCart console; buttons with busy state, empty states, reduced motion; no inline styles (CSP) | E2E 81 checks incl. mobile width |
+| **Performance** | `scripts/benchmark.py`, results in PERFORMANCE.md | measured |
+
+## 3. Data preservation
+
+- Migrations 0013 and 0014 are **additive**: new tables, new nullable or defaulted columns,
+  and widened CHECK constraints.
+- The plan check became a foreign key to the new `plans` table, which is seeded with the
+  three existing plan codes.
+- Existing organizations are marked as onboarded, and the new settings are inserted for
+  each of them.
+- No existing row is deleted or rewritten otherwise.
+- The upgrade path (original dumps → all 14 migrations) is exercised by every test run.
+- The local pre-upgrade backup (`backups\pharmastock-before-claude-upgrade.dump`) was never
+  touched.
+
+## 4. Test results (actual)
+
+| Suite | Result |
+|---|---|
+| Backend (pytest, real PostgreSQL 16, API as a restricted role) | **293 passed**, 0 failed |
+| Browser end-to-end (Chromium, fresh database) | **81 / 81 checks, 0 browser errors** |
+| Benchmark | 10 / 100 / 1,000 organizations: p95 of every measured endpoint ≤ 61 ms, sequential requests (PERFORMANCE.md) |
+| JavaScript | syntax check and duplicate-function check clean |
+
+**Defects found and fixed during this release:**
+
+- A corrupt image made the logo upload fail with 500. Pillow reports some corrupt files
+  as `SyntaxError`; the upload now answers 415, and a regression test covers it.
+- A wrong MFA code at sign-in was shown as "session ended". The frontend treated every
+  401 as a lost session.
+- Adjustments awaiting approval failed on a notification category the database did not
+  allow.
+- The background refresh could run while the connection pool was closing at shutdown.
+- The benchmark's first row counts were blocked by row level security, which is correct
+  behaviour. It now uses table statistics.
+
+## 5. Security posture
+
+See SECURITY.md. In short:
+
+- MFA is required for the platform, with step-up for risky actions.
+- There is no backdoor. Recovery access is logged in both the platform audit and the
+  organization's audit.
+- Tenant isolation is enforced by row level security. The application role has least
+  privilege.
+- Company and platform audit trails are append-only, and secrets are scrubbed from them.
+- Signed webhooks are the only way to activate a payment or record a message status.
+- Consent is required for customer messages. Uploads are validated. Outbound hosts are
+  protected against SSRF.
+
+The claims made here are those the tests check. No broader claim is made, such as "most
+secure" or a user-count capacity.
+
+## 6. Not yet verified / needs the owner
+
+- **WhatsApp Business Platform live test.** This needs a Meta business account, a phone
+  number and approved templates (`pharmastock_receipt`). The code follows the published
+  Cloud API and was tested against a simulated API.
+- **Paystack live / test-mode test.** This needs keys. Simulated signed webhooks pass.
+- **Windows / PostgreSQL 18 upgrade.** Run it on a copy of the real database first
+  (DEPLOYMENT.md B). This includes `SECRET_KEY` and, before going multi-tenant, the
+  role separation.
+- **Docker stack rebuild.** The stack was not rebuilt after the three-role change, because
+  of Docker Hub rate limits here. Run `docker compose up --build` on staging.
+- **GitHub Actions.** The CI has not yet run on GitHub. The backend job now needs
+  CREATEROLE, which the workflow grants.
+- **Load test** on the production server with concurrent users.
+- Set real prices for plans and credit packages in the console. None are invented.
+
+---
+
+# Earlier delivery (PharmaStock 2.0 full product build, 23 Sept 2026)
+
 
 Branch `claude/bold-goldberg-p2dvu3` (based on `local-import`; nothing merged into `main`, no pull request).
 All figures below were produced by running the code in this environment on 23 Sept 2026.

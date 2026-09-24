@@ -12,7 +12,9 @@
             FastAPI application (uvicorn workers, stateless)
               middleware: request id, rate limit, CSRF/origin, security headers, metrics
               routers ──► services (business logic) ──► PostgreSQL (row level security)
-              background: notification refresh · delivery outbox · scheduled reports
+              background: notification refresh · messaging outbox · scheduled reports ·
+                          subscription expiry flags
+            ◄── signed webhooks: WhatsApp Business Platform, Paystack
                        ▼
             PostgreSQL 16+: one database, many organizations (tenants)
 ```
@@ -31,21 +33,31 @@ backend/
   database.py        connection pool; tenant context (app.organization_id) per request
   migrate.py         versioned SQL migrations with checksums (+ CLI)
   security.py        scrypt passwords, hashed session and reset tokens, require(permission),
-                     require_feature(feature), require_platform_admin
+                     require_feature(feature), require_platform_admin (MFA session),
+                     require_step_up, location scoping
+  crypto.py          Fernet encryption of stored secrets (SECRET_KEY), TOTP, recovery codes
+  idempotency.py     Idempotency-Key handling for critical writes
+  security_events.py security monitoring records (own connection)
   permissions.py     roles → permissions (single source of truth)
-  audit.py           append-only audit trail written in the same transaction as the change
+  audit.py           company audit + platform audit, same transaction, secrets scrubbed
   pagination.py      limit/offset + X-Total-Count
   ratelimit.py       sliding-window limiter
   observability.py   JSON logs with request ids, metrics, error reporting hook
   manage.py          administration CLI
-  routers/           HTTP layer: auth, users, organizations, medicines, barcode, inventory,
-                     stock, dispensing, transfers, suppliers, purchasing, analytics,
-                     reports, delivery, admin, assistant
+  routers/           HTTP layer: auth (+MFA), users, organizations (+onboarding), platform
+                     (MedCart console), billing, branding (logo, receipts, /r/ links),
+                     messaging (+webhooks), medicines, barcode, inventory, stock,
+                     stock_control (adjustments, counts), dispensing, transfers, suppliers,
+                     purchasing (+approval, reorder, price history), analytics (+attention,
+                     daily brief, movers, search), reports, delivery, admin, assistant
   services/          business logic used by the API, reports, background jobs and the AI:
                      expiry, inventory, stock (ledger + FEFO), dispensing, transfers,
                      barcode (GS1), analytics, trends, notifications, delivery, scheduler,
-                     reports, exporters, assistant, organizations, plans, app_settings
-  migrations/        0001 … 0012 SQL files
+                     reports, exporters, assistant, organizations, plans (DB catalogue),
+                     app_settings, adjustments, stock_counts, billing (payments, credits),
+                     branding (logo, receipt HTML / PDF), messaging (receipts, providers,
+                     WhatsApp webhooks), intelligence (attention, brief, movers, search)
+  migrations/        0001 … 0014 SQL files
 frontend/
   index.html, style.css, manifest.json, sw.js, assets/ (logo, icons)
   js/core.js         escaping html`` templates, API client, tables, pager, forms, toasts
@@ -73,7 +85,16 @@ tests/               pytest suite (real PostgreSQL) + Playwright end-to-end scri
    authentication. Application code cannot forget a filter.
 5. **Everything audited.** Changes, sign-ins, exports, report views, AI questions,
    scheduled report runs and administrative actions go to `audit_log` in the same
-   transaction; the table is append-only (trigger).
+   transaction; platform administrators' actions go to the separate `platform_audit`.
+   Both are append-only.
+8. **Manual stock changes are adjustments.** Returns, damage, expiry write-offs,
+   count differences and corrections go through `services/adjustments.py` (reason code,
+   before / after, approval thresholds), which posts the ledger movement.
+9. **Least privilege.** Migrations run as the schema owner; the API runs as a role with
+   row privileges only. Platform access needs a second factor; risky actions a fresh one.
+10. **Outbox for everything outbound.** E-mail, SMS and WhatsApp are queued in the same
+    transaction and sent by the worker; payments and messages only change state through
+    verified provider callbacks.
 6. **Explainable intelligence.** Reorder, expiry risk, forecasts and stock-out history
    return their method, inputs, data sufficiency and limitations with the numbers.
 7. **AI is decision support only.** The assistant reads data through read-only tools;

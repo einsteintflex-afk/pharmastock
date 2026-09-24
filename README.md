@@ -2,15 +2,21 @@
 
 ![PharmaStock 2.0](frontend/assets/logo.webp)
 
+*Powered by MedCart Tech.*
+
 Pharmacy and hospital inventory intelligence platform for community pharmacies, chains,
 hospitals and wholesalers: dispensing counter (prescription / OTC, receipts, voids),
 medicine master data with GS1 barcodes, batches with quarantine / recall, configurable
 expiry engine, genuine FEFO, stock ledger with reconciliation, purchasing and suppliers,
 transfers and ward requisitions with approval, explainable reorder, expiry-risk,
-stock-out and forecasting analytics, 22 reports (CSV / Excel / PDF, scheduled by e-mail),
-notifications (in-app, e-mail, SMS), append-only audit trail, six roles, multi-organization
-SaaS with database-enforced isolation and plans, an AI inventory assistant (decision
-support only), and a responsive installable web app.
+stock-out and forecasting analytics, 26 reports (CSV / Excel / PDF with company branding,
+scheduled by e-mail), notifications (in-app, e-mail, SMS), append-only audit trails,
+eleven roles, a command center (what needs attention, daily brief), Scan Center (phone
+camera), stock counts and adjustments with approval, purchase approvals, branded receipts
+(PDF, thermal, digital link) with customer messages on WhatsApp Business / SMS / e-mail,
+two-step verification, multi-organization SaaS with database-enforced isolation, plans,
+subscriptions, verified payments and messaging credits, the MedCart Tech platform console,
+an AI inventory assistant (decision support only), and a responsive installable web app.
 
 FastAPI + PostgreSQL (row level security) backend; plain JavaScript (ES modules) frontend
 served at `/app`; Docker / HTTPS deployment.
@@ -24,7 +30,8 @@ served at `/app`; Docker / HTTPS deployment.
 | [Deployment](docs/DEPLOYMENT.md) · [Migrations](docs/MIGRATIONS.md) · [Backup](docs/BACKUP.md) | Operating it |
 | [Security](docs/SECURITY.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) | Keeping it safe and running |
 | [Admin guide](docs/ADMIN_GUIDE.md) · [User guide](docs/USER_GUIDE.md) | Using it |
-| [Mobile](docs/MOBILE.md) · [Limitations & remaining work](docs/LIMITATIONS.md) | What is next |
+| [Mobile](docs/MOBILE.md) · [Performance](docs/PERFORMANCE.md) · [Limitations & remaining work](docs/LIMITATIONS.md) | What is next |
+| [Gap analysis](docs/GAP_ANALYSIS.md) | Audit before the MedCart Tech release |
 
 ## Quick start with Docker
 
@@ -52,11 +59,12 @@ pip install -r requirements.txt
 ```
 
 Edit `.env` (see `.env.example`). Keep your existing `DATABASE_URL`, and add
-a first administrator:
+a first administrator (only if no user exists yet) and the encryption key:
 
 ```
 BOOTSTRAP_ADMIN_USERNAME=admin
 BOOTSTRAP_ADMIN_PASSWORD=<at least 10 characters, letters and numbers>
+SECRET_KEY=<python -c "import secrets; print(secrets.token_urlsafe(48))">
 ```
 
 Apply the database migrations, then start the server:
@@ -111,9 +119,9 @@ the real database is never touched):
 ```powershell
 pip install -r requirements-dev.txt
 # A non-superuser role (a superuser bypasses row level security, so the tenancy tests would fail):
-psql -U postgres -c "CREATE ROLE pharmastock_test LOGIN PASSWORD 'test-pass' CREATEDB"
+psql -U postgres -c "CREATE ROLE pharmastock_test LOGIN PASSWORD 'test-pass' CREATEDB CREATEROLE"
 $env:TEST_DATABASE_URL="postgresql://pharmastock_test:test-pass@localhost:5432/pharmastock_test"
-pytest          # 221 tests
+pytest          # 293 tests; the API runs as a restricted role the fixtures create
 ```
 
 Browser end-to-end test (Node + Playwright, against a server running on a

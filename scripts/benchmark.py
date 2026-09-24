@@ -195,7 +195,12 @@ def main() -> None:
         seeded = target
         with psycopg.connect(url_for(DB_NAME)) as conn:
             size = conn.execute("SELECT pg_size_pretty(pg_database_size(current_database()))").fetchone()[0]
-            rows = conn.execute("SELECT (SELECT COUNT(*) FROM stock_movements), (SELECT COUNT(*) FROM batches)").fetchone()
+            # Row level security hides tenant rows without an organization context:
+            # use the statistics collector's live-row counts (after ANALYZE).
+            conn.execute("ANALYZE stock_movements, batches")
+            rows = conn.execute(
+                "SELECT (SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = 'stock_movements'), "
+                "(SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = 'batches')").fetchone()
         with TestClient(app) as client:
             results = measure(client, target)
         report.append((target, size, rows, seed_seconds, results))

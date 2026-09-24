@@ -14,6 +14,11 @@ python -m backend.migrate status   # applied and pending
 python -m backend.migrate          # apply pending migrations
 ```
 
+Migrations run with `MIGRATION_DATABASE_URL` (the schema owner) when set, otherwise
+`DATABASE_URL`. With `APP_DB_ROLE=pharmastock_app` the run ends by granting the
+application role its row privileges on every table (idempotent), so new tables are
+covered automatically.
+
 In Docker the entrypoint applies migrations before starting (set `RUN_MIGRATIONS=false`
 to do it manually).
 
@@ -47,6 +52,8 @@ restore is the only rollback that is guaranteed to be complete.
 | 0010 | Transfers and requisitions, TRANSFER_IN/OUT, transfer notifications | setting added per organization |
 | 0011 | Notification preferences, delivery outbox, scheduled reports | — |
 | 0012 | Password reset tokens, session device names | — |
+| 0013 | New roles; MFA fields and challenges; platform audit (append-only); security events; idempotency keys; stock adjustments and counts; purchase approval states and expected date; receipt discount / tax / token / consent; logo files; plans catalogue (organizations.plan becomes a foreign key), subscriptions, payments, credit packages and ledger; messaging providers, consents, routes, opt-outs; MedCart Tech platform settings; new organization settings | additive; existing organizations marked onboarded; new settings inserted for every organization; no existing row changed otherwise |
+| 0014 | WhatsApp number → organization routing; index on deliveries by sale | additive |
 
 ## Writing a new migration
 

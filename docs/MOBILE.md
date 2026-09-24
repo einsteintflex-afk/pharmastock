@@ -16,7 +16,10 @@
   - `limit` / `offset` pagination with `X-Total-Count` on list endpoints;
   - compact scan endpoint `POST /api/v1/barcode/lookup` (medicine, batch, FEFO batch,
     open orders, warnings in one call);
-  - consistent JSON errors, rate limits with `Retry-After`, request ids.
+  - consistent JSON errors, rate limits with `Retry-After`, request ids;
+  - `Idempotency-Key` on sales, receipts, adjustments, count posting and transfers, so a
+    phone that loses the connection mid-request can safely retry;
+  - Scan Center on the phone camera: look up, receive, count, sell, adjust, transfer.
 
 ## Planned native app (recommended architecture)
 

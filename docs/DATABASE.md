@@ -23,8 +23,29 @@ created and upgraded only by migrations (`backend/migrations`, see MIGRATIONS.md
 | `notification_deliveries` | ✓ | E-mail / SMS outbox with retries |
 | `scheduled_reports` | ✓ | Report schedules (report, format, frequency, recipients) |
 | `app_settings` | ✓ | Per-organization settings (expiry thresholds, reorder rules, currency, receipt header, transfer approval) |
-| `audit_log` | ✓ (NULL org allowed for pre-login events) | Append-only audit trail |
+| `audit_log` | ✓ (NULL org allowed for pre-login events) | Append-only company audit trail |
+| `stock_adjustments` | ✓ | Every manual stock change: reason code, previous / change / new quantity, cost, status (pending approval, posted, rejected, cancelled), requester, approver, session, device, request id |
+| `stock_counts`, `stock_count_lines` | ✓ | Physical counts per location; each line keeps the recorded quantity at the moment of counting and links to the adjustment it produced |
+| `idempotency_keys` | ✓ | Stored responses of critical requests (per organization, user and key) |
+| `organization_files` | ✓ | Company logo (re-encoded PNG, bytea) |
+| `messaging_providers` | ✓ | Organization's own WhatsApp / SMS / SMTP settings (encrypted JSON) |
+| `message_consents` | ✓ | Customer consent per phone number and channel (opted in / out, source) |
+| `messaging_credit_ledger` | ✓ | Credits bought, used per message, refunded, granted |
+| `receipt_links` | — (token lookup) | Digital-receipt token → organization, sale, expiry |
+| `whatsapp_numbers` | — (routing) | WhatsApp phone number id → organization, for webhooks |
+| `provider_message_routes` | — (routing) | Provider message id → organization and delivery, for status webhooks |
+| `plans` | — (catalogue) | Plans: limits, features, optional prices (managed by MedCart Tech) |
+| `subscriptions`, `payments`, `messaging_packages` | — (explicit filter) | Paid periods, payments (unique reference, provider, status), credit packages |
+| `platform_settings` | — | MedCart Tech settings (e.g. "Powered by MedCart Tech") |
+| `platform_audit` | — (platform only) | Append-only audit of platform administrators' actions |
+| `security_events` | — (platform only) | Failed sign-ins / codes, refused access, cross-tenant probes, rate limits |
+| `platform_opt_outs` | — | STOP replies on the platform WhatsApp number |
+| `mfa_challenges` | — | Pending second sign-in steps (token hash, attempts, expiry) |
 | `schema_migrations` | — | Applied migrations and checksums |
+
+`users` also holds the encrypted TOTP secret, hashed recovery codes and the last used
+time step; `sessions` records whether a session is privileged (platform) and when it
+last proved a second factor.
 
 ## Integrity rules enforced by the database
 
@@ -32,7 +53,8 @@ created and upgraded only by migrations (`backend/migrations`, see MIGRATIONS.md
 - Unique per organization: medicine identity (name + strength + form), GTIN, supplier name,
   location name, order number, dispensation number, transfer number, settings key.
 - Enumerations as CHECK constraints: movement types, statuses, roles, plans, hold status.
-- `audit_log` rejects UPDATE and DELETE (trigger).
+- `audit_log` and `platform_audit` reject UPDATE and DELETE (triggers); the application
+  role also has no UPDATE / DELETE privilege on them or on `security_events`.
 - Row level security, **forced** also for the table owner: `organization_id = current_org()`,
   where `current_org()` reads the connection setting `app.organization_id`. With no
   organization set, business tables return no rows and reject inserts.
@@ -41,7 +63,8 @@ created and upgraded only by migrations (`backend/migrations`, see MIGRATIONS.md
 
 | Role | Rights |
 |---|---|
-| `pharmastock_app` | Owns the schema; used by the application; **not** superuser, **no** BYPASSRLS (so isolation applies). The server refuses to start in production otherwise. |
+| `pharmastock_owner` | Owns the database and schema; used **only** to apply migrations (`MIGRATION_DATABASE_URL`) |
+| `pharmastock_app` | Used by the application: SELECT / INSERT / UPDATE / DELETE on tables (INSERT / SELECT only on the audit trails), sequences; **not** owner, superuser or BYPASSRLS; cannot change the schema. Privileges are (re)granted by `python -m backend.migrate` when `APP_DB_ROLE` is set. The server refuses a superuser / BYPASSRLS role in production. |
 | `pharmastock_backup` | Read-only (`pg_read_all_data`) + BYPASSRLS, for `pg_dump` of all organizations |
 | superuser | Only for creating roles and restoring backups |
 

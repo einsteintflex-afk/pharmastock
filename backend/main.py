@@ -110,6 +110,8 @@ def _refresh_notifications() -> None:
         if expired:
             logger.info("Subscriptions / trials ended: %s organization(s)", expired)
         for organization_id in organization_ids:
+            if database.pool is None:
+                return  # shutting down
             with database.organization_connection(organization_id) as conn:
                 result = notifications.refresh(conn)
                 conn.commit()
@@ -124,6 +126,8 @@ def _process_deliveries() -> None:
         with database.pool.connection() as conn:
             organization_ids = database.active_organization_ids(conn)
         for organization_id in organization_ids:
+            if database.pool is None:
+                return  # shutting down
             with database.organization_connection(organization_id) as conn:
                 ran = scheduler.run_due(conn)
                 sent = delivery_service.process_outbox(conn)

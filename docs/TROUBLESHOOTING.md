@@ -20,3 +20,17 @@
 | Barcode not recognised | Add the GTIN to the medicine (Medicines → Edit). Codes without batch / expiry still identify the medicine. |
 | Camera button missing on Scan | The browser lacks BarcodeDetector (use Chrome/Edge on Android or a USB/Bluetooth scanner). |
 | A user reports an error | Ask for the `request_id` shown / in `X-Request-ID`; search the logs for it. |
+| Server exits in production: "SECRET_KEY is not set" | Set `SECRET_KEY` (48+ random characters) in the environment; keep a copy with the backups. |
+| "Stored secret cannot be decrypted (SECRET_KEY changed?)" | `SECRET_KEY` differs from the one used when MFA / providers were set up. Restore the old key; otherwise reset users' MFA (Users → Reset 2-step) and re-enter provider credentials. |
+| Lost authenticator phone | Sign in with a recovery code, then set MFA up again. No codes left: an administrator uses **Reset 2-step**; the owner / last administrator asks MedCart Tech for recovery access. |
+| "Incorrect code" although the code is shown in the app | The phone's clock is wrong: turn on automatic time. Each code works once. |
+| 403 "requires two-step verification for your role" | The organization requires MFA for owners / administrators: set it up under My account. |
+| Platform console says to sign in with a code | Platform access needs a session signed in with MFA; sign out and in again. High-risk actions ask for a fresh code (step-up). |
+| 422 "Idempotency-Key was already used for a different request" | The client reused a key for a different operation; generate a new key per user action. |
+| WhatsApp messages SKIPPED | The outbox reason says why: messaging mode off, plan without WhatsApp, no consent / opted out, no credits, provider not set up, or no approved template. |
+| WhatsApp webhook answers 401 | `WHATSAPP_APP_SECRET` (platform number) or the organization's app secret does not match the Meta app; the verify step needs `WHATSAPP_VERIFY_TOKEN`. |
+| Plan did not change after paying | Activation waits for the provider's signed webhook (check the Paystack webhook URL and secret) or, for manual payments, confirmation in the MedCart console. |
+| Logo refused (415) | Only PNG, JPEG or WebP images up to 2 MB that open correctly are accepted. |
+| Adjustment "waiting for approval" | Above the thresholds in Settings → Controls; a manager approves it under Adjustments (not the requester). |
+| Purchase order cannot be received | With approval turned on, the order must be approved (and ideally marked sent) first. |
+| Migration error "permission denied" | Run migrations with `MIGRATION_DATABASE_URL` pointing at the schema owner, not the application role. |
