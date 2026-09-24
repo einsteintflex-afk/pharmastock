@@ -6,6 +6,7 @@
 // Run against a TEST copy of the database: it creates records.
 // Fails (exit 1) on any failed check, uncaught page error or console error.
 
+import { createHmac } from "node:crypto";
 import { chromium } from "playwright";
 
 const BASE = process.env.BASE_URL || "http://localhost:8000";
@@ -53,6 +54,19 @@ async function shot(page, name) {
     if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png`, fullPage: true });
 }
 
+/** RFC 6238 TOTP (SHA-1, 30 s, 6 digits) for the two-step verification test. */
+function totp(secret, offset = 0) {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let bits = "";
+    for (const c of secret.replace(/[\s=]/g, "").toUpperCase()) bits += alphabet.indexOf(c).toString(2).padStart(5, "0");
+    const key = Buffer.from(bits.match(/.{8}/g).map(b => parseInt(b, 2)));
+    const counter = Buffer.alloc(8);
+    counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30000) + offset));
+    const digest = createHmac("sha1", key).update(counter).digest();
+    const o = digest[19] & 15;
+    return String((digest.readUInt32BE(o) & 0x7fffffff) % 1_000_000).padStart(6, "0");
+}
+
 async function login(page, username, password) {
     await page.fill("#login-username", username);
     await page.fill("#login-password", password);
@@ -85,7 +99,7 @@ await check("first sign-in forces password change", async () => {
     await page.fill("#pw-repeat", NEW_PASSWORD);
     await page.click("#pw-form button[type=submit]");
     await page.waitForFunction(() => location.hash.includes("dashboard"));
-    expect((await heading(page)) === "Dashboard", "not redirected to dashboard");
+    expect((await heading(page)).startsWith("Good "), "not redirected to the command center");
 });
 
 await check("dashboard shows live figures", async () => {
@@ -98,12 +112,13 @@ await check("dashboard shows live figures", async () => {
 
 const pages = {
     medicines: "Medicines", inventory: "Inventory", expiry: "Expiry Alerts", dispense: "Dispensing Counter",
-    dispensations: "Dispensing History",
+    dispensations: "Dispensing History", "stock-counts": "Stock Counts", adjustments: "Stock Adjustments",
+    reorder: "Reorder", messaging: "Messaging", onboarding: "Welcome to PharmaStock",
     movements: "Stock Movements", purchasing: "Purchasing", suppliers: "Suppliers", analytics: "Analytics",
     reports: "Reports", assistant: "AI Inventory Assistant", notifications: "Notifications", audit: "Audit Trail",
     users: "Users", settings: "Settings", account: "My Account",
-    scan: "Barcode Scan", transfers: "Transfers", reconciliation: "Stock Reconciliation",
-    delivery: "E-mail, SMS & Scheduled Reports", platform: "Platform: Organizations",
+    scan: "Scan Center", transfers: "Transfers", reconciliation: "Stock Reconciliation",
+    delivery: "E-mail, SMS & Scheduled Reports", platform: "MedCart Console",
 };
 for (const [hash, title] of Object.entries(pages)) {
     await check(`page ${hash} renders`, async () => {
@@ -111,7 +126,8 @@ for (const [hash, title] of Object.entries(pages)) {
         expect((await heading(page)) === title, `heading was ${await heading(page)}`);
         expect(!(await page.$(".error-text")), "error block shown");
         const active = await page.$eval(".nav-item.active", el => el.getAttribute("href")).catch(() => null);
-        if (hash !== "account") expect(active === `#/${hash}`, `active nav ${active}`);
+        // The set-up guide leaves the menu once set-up is complete.
+        if (hash !== "account" && hash !== "onboarding") expect(active === `#/${hash}`, `active nav ${active}`);
     });
 }
 
@@ -498,11 +514,153 @@ await check("void dispensation returns stock", async () => {
 
 await check("settings change updates thresholds", async () => {
     await go(page, "settings");
-    await page.click('[data-action="edit-settings"]');
+    await page.click('[data-action="edit-group"][data-group="stock"]');
     await page.fill('[name="expiry.critical_days"]', "200");
     await page.click(".modal button[type=submit]");
     await page.waitForSelector(".modal .form-error:not([hidden])");
     await page.click(".modal [data-cancel]");
+});
+
+await check("command center: quick actions, attention list, daily brief", async () => {
+    await go(page, "dashboard");
+    expect(await page.$$eval(".quick-actions a", a => a.length) >= 4, "quick actions missing");
+    await page.waitForSelector(".attention-list, .empty-state");
+    await page.waitForSelector(".brief-lines li");
+    await shot(page, "20-command-center");
+});
+
+await check("grouped navigation sections", async () => {
+    const sections = await page.$$eval(".nav-section-title", b => b.map(x => x.textContent.trim()));
+    for (const name of ["Overview", "Sales", "Inventory", "Purchasing", "Insights", "Administration"]) {
+        expect(sections.includes(name), `missing section ${name}: ${sections}`);
+    }
+    expect((await page.textContent(".sidebar")).includes("MedCart Tech"), "no MedCart Tech attribution");
+});
+
+await check("global search finds a medicine", async () => {
+    await go(page, "dashboard");
+    await page.fill("#global-search-input", "Amoxi");
+    await page.waitForSelector(".search-hit");
+    await page.click(".search-group .search-hit");
+    await page.waitForFunction(() => location.hash.startsWith("#/medicines/"));
+});
+
+await check("stock count: count a batch, submit, post", async () => {
+    await go(page, "stock-counts");
+    await page.click('[data-action="new"]');
+    await page.selectOption("#f-location_id", { index: 1 });
+    await page.fill("#f-name", `E2E count ${stamp}`);
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector("#count-form");
+    const batch = await page.$eval("#count-uncounted tbody tr td:nth-child(2)", td => td.textContent.trim());
+    await page.fill("#count-code", batch);
+    await page.selectOption("#count-mode", "set");
+    await page.fill("#count-qty", "1");
+    await page.click("#count-form button[type=submit]");
+    await page.waitForSelector(`#count-lines >> text=${batch}`);
+    await shot(page, "21-stock-count");
+    await page.click('[data-action="submit"]');
+    await page.waitForSelector('[data-action="post"]');
+    await page.click('[data-action="post"]');
+    await page.waitForSelector(".topbar >> text=POSTED");
+});
+
+await check("adjustment with a reason code", async () => {
+    await go(page, "adjustments");
+    await page.waitForSelector("#adjustments");
+    await page.click('.topbar [data-action="new"]');
+    await page.selectOption("#f-medicine_id", { index: 1 });
+    await page.waitForFunction(() => document.querySelectorAll("#f-batch_id option").length > 1);
+    await page.selectOption("#f-batch_id", { index: 1 });
+    await page.selectOption("#f-reason_code", "DATA_ENTRY_CORRECTION");
+    await page.selectOption("#f-mode", "change");
+    await page.fill("#f-quantity", "1");
+    await page.click(".modal button[type=submit]");
+    await page.waitForSelector("text=posted");
+    await go(page, "adjustments");
+    expect(await page.$$eval("#adjustments tbody tr", r => r.length) >= 2, "adjustments not listed");
+});
+
+await check("receipt PDF and digital link from a sale", async () => {
+    await go(page, "dispensations");
+    await page.click("#main a[href^='#/dispensations/']");
+    await page.waitForSelector('[data-receipt="pdf"]');
+    const [download] = await Promise.all([page.waitForEvent("download"), page.click('[data-receipt="thermal"]')]);
+    expect((await download.suggestedFilename()).endsWith(".pdf"), "no PDF");
+});
+
+await check("company logo upload appears on settings", async () => {
+    await go(page, "settings");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAACgAAAAUCAIAAABwJOjsAAAAJ0lEQVR4nGPktU5jGAjANCC2jlo8avGoxaMWj1o8avGoxaMWDwgAADIQANa2XZcjAAAAAElFTkSuQmCC", "base64");
+    await page.setInputFiles("#logo-file", { name: "logo.png", mimeType: "image/png", buffer: png });
+    await page.waitForSelector("img.logo-preview");
+});
+
+await check("messaging: explicit activation of a mode", async () => {
+    await go(page, "messaging");
+    await page.check('input[name=mode][value="PLATFORM_CREDITS"]');
+    await page.waitForSelector('.mode-card.active >> text=Through MedCart Tech');
+    await page.check('input[name=mode][value="DISABLED"]');
+    await page.waitForSelector('.mode-card.active >> text=Off');
+});
+
+await check("scan center: unknown barcode offers to create the medicine", async () => {
+    await go(page, "scan");
+    await page.fill("#scan-code", "05000000000012");
+    await page.click("#scan-form button[type=submit]");
+    await page.waitForSelector("text=PRODUCT NOT FOUND");
+    await page.click("text=Create new medicine");
+    await page.waitForSelector("#f-gtin");
+    expect((await page.inputValue("#f-gtin")) === "05000000000012", "GTIN not prefilled");
+    await page.click(".modal [data-cancel]");
+});
+
+await check("platform console asks for two-step verification", async () => {
+    await go(page, "platform");
+    await page.waitForSelector("#main .empty-state >> text=two-step verification");
+});
+
+await check("two-step verification: set up, then sign in with a recovery code", async () => {
+    const created = await page.evaluate(async name => (await fetch("/users", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Requested-With": "PharmaStock" },
+        body: JSON.stringify({ username: name, full_name: "E2E MFA", role: "PHARMACIST", password: "Mfa-temp-pass-26" }),
+    })).status, `mfa${stamp}`);
+    expect(created === 201, `create user ${created}`);
+    const ctx3 = await browser.newContext();
+    ctx3.setDefaultTimeout(8000);
+    const p3 = await ctx3.newPage();
+    watch(p3, "mfa");
+    await p3.goto(`${BASE}/app/`);
+    await login(p3, `mfa${stamp}`, "Mfa-temp-pass-26");
+    await p3.waitForSelector("#pw-form");
+    await p3.fill("#pw-current", "Mfa-temp-pass-26");
+    await p3.fill("#pw-new", "Mfa-perm-pass-26");
+    await p3.fill("#pw-repeat", "Mfa-perm-pass-26");
+    await p3.click("#pw-form button[type=submit]");
+    await p3.waitForFunction(() => !location.hash.includes("account"));
+    await p3.goto(`${BASE}/app/#/account`);
+    await p3.click('[data-mfa="setup"]');
+    await p3.fill("#f-password", "Mfa-perm-pass-26");
+    await p3.click(".modal button[type=submit]");
+    await p3.waitForSelector(".mfa-setup .secret");
+    const secret = (await p3.textContent(".mfa-setup .secret")).replace(/\s/g, "");
+    await p3.fill("#mfa-code", totp(secret));
+    await p3.click("#mfa-enable button[type=submit]");
+    await p3.waitForSelector(".recovery-codes li code");
+    const code = (await p3.textContent(".recovery-codes li code")).trim();
+    await shot(p3, "22-mfa-enabled");
+    await p3.goto(`${BASE}/app/#/dispensations`);
+    await p3.click("#logout-btn");
+    await p3.waitForSelector("#login:not([hidden])");
+    await login(p3, `mfa${stamp}`, "Mfa-perm-pass-26");
+    await p3.waitForSelector("#mfa-form:not([hidden])");
+    await p3.fill("#mfa-login-code", "000000");
+    await p3.click("#mfa-form button[type=submit]");
+    await p3.waitForSelector("#mfa-error:not([hidden])");
+    await p3.fill("#mfa-login-code", code);
+    await p3.click("#mfa-form button[type=submit]");
+    await p3.waitForSelector("#app:not([hidden])");
+    await ctx3.close();
 });
 
 await check("create viewer user", async () => {

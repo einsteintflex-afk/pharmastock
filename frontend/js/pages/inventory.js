@@ -14,17 +14,18 @@ async function lookups() {
     return { medicines, locations: locations.filter(l => l.is_active), suppliers };
 }
 
-export async function openBatchForm(medicineId, onSaved) {
+export async function openBatchForm(medicineId, onSaved, prefill = {}) {
     const { medicines, locations, suppliers } = await lookups();
     const fields = [
         { name: "barcode_data", label: "Scan pack barcode (optional)", maxlength: 200, full: true, autocomplete: "off",
+          value: prefill.barcode_data,
           help: "A GS1 DataMatrix scan fills in the medicine, batch number and expiry date." },
         { name: "medicine_id", label: "Medicine", type: "select", required: true, value: medicineId, placeholder: "Select…",
           options: medicines.filter(m => m.is_active !== false || m.id === medicineId)
               .map(m => ({ value: m.id, label: `${m.name} ${m.strength || ""} ${m.dosage_form || ""}` })) },
-        { name: "batch_number", label: "Batch number", required: true, maxlength: 100 },
+        { name: "batch_number", label: "Batch number", required: true, maxlength: 100, value: prefill.batch_number },
         { name: "quantity", label: "Quantity (units)", type: "number", min: 0, step: 1, required: true },
-        { name: "expiry_date", label: "Expiry date", type: "date", required: true },
+        { name: "expiry_date", label: "Expiry date", type: "date", required: true, value: prefill.expiry_date },
         { name: "unit_cost", label: "Unit cost", type: "number", min: 0, step: "0.01", help: "Acquisition cost per unit (for valuation)." },
         { name: "location_id", label: "Location", type: "select", value: locations[0]?.id,
           options: locations.map(l => ({ value: l.id, label: l.name })) },

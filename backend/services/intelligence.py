@@ -164,7 +164,7 @@ def attention(conn: psycopg.Connection, user: CurrentUser) -> list[dict]:
     failed = one("SELECT COUNT(*) AS n FROM notification_deliveries WHERE status = 'FAILED' "
                  "AND created_at >= CURRENT_DATE - 7")
     add("failed_messages", "WARNING", "Messages that could not be delivered", "Last 7 days", failed["n"],
-        "#/deliveries", "settings.manage")
+        "#/delivery", "settings.manage")
 
     org = one("SELECT subscription_status, onboarding_completed_at, status, trial_ends_at FROM organizations "
               "WHERE id = %s", user.organization_id)

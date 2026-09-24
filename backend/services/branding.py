@@ -60,7 +60,7 @@ def profile(conn: psycopg.Connection, with_logo: bool = True) -> dict:
 
 
 def validate_logo(data: bytes) -> tuple[bytes, int, int]:
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image
 
     if not data:
         raise HTTPException(status_code=400, detail="The file is empty")
@@ -81,7 +81,9 @@ def validate_logo(data: bytes) -> tuple[bytes, int, int]:
             return out.getvalue(), image.width, image.height
     except HTTPException:
         raise
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+    except Exception:  # noqa: BLE001
+        # Pillow reports corrupt files with many exception types (UnidentifiedImageError,
+        # OSError, ValueError, DecompressionBombError, even SyntaxError): all mean "not an image".
         raise HTTPException(status_code=415, detail="The file is not a valid image")
 
 

@@ -242,6 +242,9 @@ def test_logo_upload_is_validated_and_reencoded(api):
                           ).status_code == 415
     too_big = api.client.put("/branding/logo", content=b"0" * (2 * 1024 * 1024 + 1), headers=headers)
     assert too_big.status_code == 413
+    broken = bytearray(_png())
+    broken[40] ^= 0xFF  # corrupt the image data (bad checksum)
+    assert api.client.put("/branding/logo", content=bytes(broken), headers=headers).status_code == 415
     polyglot = _png() + b"<script>alert(1)</script>"
     ok = api.client.put("/branding/logo", content=polyglot, headers=headers)
     assert ok.status_code == 200, ok.text

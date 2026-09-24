@@ -101,6 +101,10 @@ const BADGE_CLASS = {
     "SKIPPED": "muted", "INSUFFICIENT": "expired", "LIMITED": "urgent", "ADEQUATE": "normal",
     "TRIAL": "info", "SUSPENDED": "expired", "BASIC": "muted", "PROFESSIONAL": "info", "ENTERPRISE": "normal",
     "COMPLETED": "normal", "VOIDED": "muted",
+    "SUBMITTED": "urgent", "PENDING_APPROVAL": "urgent", "POSTED": "normal", "IN_PROGRESS": "info",
+    "OVERDUE": "expired", "PAID": "normal", "OPTED_IN": "normal", "OPTED_OUT": "muted", "DELIVERED": "normal",
+    "READ": "normal", "PAST_DUE": "expired", "TRIAL_ENDED": "expired", "SUCCESS": "normal",
+    "FAST": "info", "DEAD": "expired", "DISABLED": "muted", "OWN_PROVIDER": "info", "PLATFORM_CREDITS": "info",
 };
 
 /* Signed effect of a movement on stock (ADJUSTMENT is stored signed). */
@@ -151,7 +155,28 @@ export class ApiError extends Error {
 let unauthorizedHandler = () => {};
 export function onUnauthorized(handler) { unauthorizedHandler = handler; }
 
-export async function api(path, { method = "GET", body, params, raw = false } = {}) {
+// High-risk platform actions answer 403 "step_up_required": ask for a fresh
+// authenticator code once, then retry the request.
+let stepUpHandler = null;
+export function onStepUp(handler) { stepUpHandler = handler; }
+
+/** A fresh key for Idempotency-Key headers (one per user action, reused on retry). */
+export function idempotencyKey() {
+    return (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+}
+
+export async function api(path, options = {}) {
+    try {
+        return await request(path, options);
+    } catch (error) {
+        if (error.status === 403 && String(error.message).startsWith("step_up_required") && stepUpHandler && !options.noStepUp) {
+            if (await stepUpHandler()) return request(path, options);
+        }
+        throw error;
+    }
+}
+
+async function request(path, { method = "GET", body, params, raw = false, headers = {}, rawBody } = {}) {
     let url = path;
     if (params) {
         const query = new URLSearchParams();
@@ -168,14 +193,16 @@ export async function api(path, { method = "GET", body, params, raw = false } = 
             method,
             credentials: "same-origin",
             // The custom header is the CSRF guard for cookie sessions (see backend/main.py).
-            headers: { "X-Requested-With": "PharmaStock", ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
-            body: body !== undefined ? JSON.stringify(body) : undefined,
+            headers: { "X-Requested-With": "PharmaStock", ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+                       ...headers },
+            body: rawBody !== undefined ? rawBody : body !== undefined ? JSON.stringify(body) : undefined,
         });
     } catch {
         throw new ApiError(0, "Unable to connect to the PharmaStock server.");
     }
 
-    if (response.status === 401 && path !== "/auth/login") {
+    // Sign-in steps answer 401 for a wrong password / code: that is not an ended session.
+    if (response.status === 401 && path !== "/auth/login" && path !== "/auth/mfa/verify") {
         unauthorizedHandler();
         throw new ApiError(401, "Your session has ended. Please sign in again.");
     }
@@ -208,6 +235,40 @@ export async function download(path, params) {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+/**
+ * Run an action from a button: shows a spinner, disables the button while
+ * it runs (no double submission), reports errors as a toast.
+ */
+export async function busy(button, action) {
+    if (button?.dataset.busy) return undefined;
+    const label = button?.innerHTML;
+    if (button) {
+        button.dataset.busy = "1";
+        button.disabled = true;
+        button.setAttribute("aria-busy", "true");
+        button.classList.add("is-busy");
+    }
+    try {
+        return await action();
+    } catch (error) {
+        toast(error.message || String(error), "error");
+        return undefined;
+    } finally {
+        if (button && button.isConnected) {
+            delete button.dataset.busy;
+            button.disabled = false;
+            button.removeAttribute("aria-busy");
+            button.classList.remove("is-busy");
+            button.innerHTML = label;
+        }
+    }
+}
+
+/** Empty state with an optional call to action. */
+export function emptyState(message, action = "") {
+    return html`<div class="empty-state"><span aria-hidden="true">○</span><p>${message}</p>${action}</div>`;
 }
 
 /* ---------- Toasts ---------- */

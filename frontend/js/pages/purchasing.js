@@ -1,24 +1,26 @@
 /* Purchasing: orders, lines, receiving (partial / full), cancellation. */
 
 import {
-    api, badge, confirmModal, formModal, formatDate, formatDateTime, html, money, mount, number, onAction,
-    pageHeader, sortableTable, statTile, table, toast,
+    api, badge, busy, confirmModal, emptyState, formModal, formatDate, formatDateTime, html, idempotencyKey, money,
+    mount, number, onAction, pageHeader, sortableTable, statTile, table, toast, today,
 } from "../core.js";
 
-const STATUSES = ["DRAFT", "ORDERED", "PARTIALLY_RECEIVED", "RECEIVED", "CANCELLED"];
+const STATUSES = ["DRAFT", "SUBMITTED", "APPROVED", "ORDERED", "PARTIALLY_RECEIVED", "RECEIVED", "CANCELLED"];
 
 export async function renderList(ctx) {
     const [orders, suppliers] = await Promise.all([api("/purchase-orders"), api("/suppliers")]);
     if (!ctx.isCurrent()) return;
 
-    const open = orders.filter(o => ["DRAFT", "ORDERED", "PARTIALLY_RECEIVED"].includes(o.status));
+    const open = orders.filter(o => ["DRAFT", "SUBMITTED", "APPROVED", "ORDERED", "PARTIALLY_RECEIVED"].includes(o.status));
     mount(ctx.main, html`
         ${pageHeader("Purchasing", "Purchase orders and deliveries", ctx.can("purchasing.write")
-            ? html`<button type="button" class="refresh-btn primary" data-action="new">+ New Purchase Order</button>` : "")}
+            ? html`<a class="refresh-btn" href="#/reorder">🛒 From reorder list</a>
+                <button type="button" class="refresh-btn primary" data-action="new">+ New Purchase Order</button>` : "")}
         <section class="cards">
             ${statTile("Open orders", number(open.length), "blue")}
             ${statTile("Awaiting delivery (units)", number(open.reduce((s, o) => s + o.units_ordered - o.units_received, 0)), "orange")}
             ${statTile("Open order value", money(open.reduce((s, o) => s + Number(o.order_value), 0)), "green")}
+            ${statTile("Overdue deliveries", number(orders.filter(o => o.overdue).length), "red", "past the expected date")}
         </section>
         <section class="section">
             <div class="toolbar">
@@ -26,6 +28,7 @@ export async function renderList(ctx) {
                     ${STATUSES.map(s => html`<option value="${s}">${s.replaceAll("_", " ")}</option>`)}</select>
                 <select id="po-supplier" aria-label="Supplier"><option value="">All suppliers</option>
                     ${suppliers.map(s => html`<option value="${s.id}">${s.name}</option>`)}</select>
+                <label class="inline-check"><input type="checkbox" id="po-overdue"> Overdue only</label>
             </div>
             <div id="po-table"></div>
         </section>`);
@@ -37,16 +40,23 @@ export async function renderList(ctx) {
         { label: "Lines", key: "items", className: "num" },
         { label: "Received", render: o => `${number(o.units_received)} / ${number(o.units_ordered)}`, sort: o => o.units_received / (o.units_ordered || 1) },
         { label: "Value", key: "order_value", render: o => money(o.order_value), className: "num", sort: o => Number(o.order_value) },
+        { label: "Expected", key: "expected_delivery_date", render: o => o.expected_delivery_date
+            ? html`${formatDate(o.expected_delivery_date)} ${o.overdue ? badge("OVERDUE") : ""}` : "—" },
         { label: "Status", key: "status", render: o => badge(o.status) },
         { label: "Created by", key: "created_by_name", render: o => o.created_by_name || "—" },
     ];
     const status = ctx.main.querySelector("#po-status");
     const supplier = ctx.main.querySelector("#po-supplier");
+    const overdue = ctx.main.querySelector("#po-overdue");
+    status.value = ctx.params.query.status || "";
+    overdue.checked = ctx.params.query.overdue === "true";
     const draw = () => sortableTable(ctx.main.querySelector("#po-table"), "po-table-el", columns,
-        orders.filter(o => (!status.value || o.status === status.value) && (!supplier.value || String(o.supplier_id) === supplier.value)),
-        { empty: "No purchase orders." });
+        orders.filter(o => (!status.value || o.status === status.value) && (!supplier.value || String(o.supplier_id) === supplier.value)
+            && (!overdue.checked || o.overdue)),
+        { empty: "No purchase orders match." });
     status.addEventListener("change", draw);
     supplier.addEventListener("change", draw);
+    overdue.addEventListener("change", draw);
     draw();
 
     onAction(ctx.main, {
@@ -58,6 +68,7 @@ export async function renderList(ctx) {
                     { name: "supplier_id", label: "Supplier", type: "select", required: true, placeholder: "Select…",
                       options: suppliers.filter(s => s.is_active).map(s => ({ value: s.id, label: s.name })) },
                     { name: "order_number", label: "Order number", required: true, value: order_number, maxlength: 50 },
+                    { name: "expected_delivery_date", label: "Expected delivery", type: "date", min: today() },
                     { name: "notes", label: "Notes", type: "textarea", full: true },
                 ],
                 submitLabel: "Create Order",
@@ -79,21 +90,45 @@ export async function renderDetail(ctx) {
     ]);
     if (!ctx.isCurrent()) return;
     const o = data.order;
-    const editable = !["RECEIVED", "CANCELLED"].includes(o.status);
+    const workflow = data.approval_required;
+    const editable = workflow ? o.status === "DRAFT" : !["RECEIVED", "CANCELLED", "SUBMITTED", "APPROVED"].includes(o.status);
     const canWrite = ctx.can("purchasing.write") && editable;
-    const canReceive = ctx.can("purchasing.receive") && o.status !== "CANCELLED";
+    const canCancel = ctx.can("purchasing.write") && !["RECEIVED", "CANCELLED"].includes(o.status);
+    const canReceive = ctx.can("purchasing.receive") && !["CANCELLED", "SUBMITTED"].includes(o.status)
+        && !(workflow && o.status === "DRAFT");
+    const flow = [];
+    if (workflow && o.status === "DRAFT" && ctx.can("purchasing.write") && data.items.length) {
+        flow.push(html`<button type="button" class="refresh-btn primary" data-action="submit">Submit for approval →</button>`);
+    }
+    if (o.status === "SUBMITTED" && ctx.can("purchasing.approve") && o.submitted_by !== ctx.user.id) {
+        flow.push(html`<button type="button" class="refresh-btn primary" data-action="approve">✓ Approve</button>
+            <button type="button" class="refresh-btn danger" data-action="reject">✕ Reject to draft</button>`);
+    }
+    if (o.status === "APPROVED" && ctx.can("purchasing.write")) {
+        flow.push(html`<button type="button" class="refresh-btn primary" data-action="ordered">📨 Mark as sent to supplier</button>`);
+    }
 
     mount(ctx.main, html`
         ${pageHeader(`Purchase Order ${o.order_number}`, `${o.supplier} · ordered ${formatDate(o.order_date)}${o.created_by_name ? ` by ${o.created_by_name}` : ""}`, html`
             <a class="view-btn" href="#/purchasing">← Orders</a>
-            ${canWrite ? html`<button type="button" class="refresh-btn" data-action="notes">Edit notes</button>
-                <button type="button" class="refresh-btn danger" data-action="cancel">Cancel order</button>` : ""}`)}
+            ${flow}
+            ${ctx.can("purchasing.write") && !["RECEIVED", "CANCELLED"].includes(o.status) ? html`<button type="button" class="refresh-btn" data-action="notes">Edit notes / date</button>` : ""}
+            ${canCancel ? html`<button type="button" class="refresh-btn danger" data-action="cancel">Cancel order</button>` : ""}`)}
         <section class="cards">
             <div class="card"><div><span>Status</span><strong>${badge(o.status)}</strong></div></div>
             ${statTile("Order value", money(data.totals.order_value), "blue")}
             ${statTile("Received value", money(data.totals.received_value), "green")}
             ${statTile("Units received", `${number(data.totals.units_received)} / ${number(data.totals.units_ordered)}`, "orange")}
+            ${statTile("Expected delivery", o.expected_delivery_date ? formatDate(o.expected_delivery_date) : "—", o.overdue ? "red" : "blue",
+                o.overdue ? "OVERDUE" : "")}
         </section>
+        ${workflow || o.submitted_at ? html`<section class="section approval-trail">
+            <ol class="steps">
+                <li class="${o.submitted_at ? "done" : ""}">Submitted${o.submitted_at ? html`<small>${formatDateTime(o.submitted_at)} · ${o.submitted_by_name}</small>` : ""}</li>
+                <li class="${o.approved_at ? "done" : ""}">Approved${o.approved_at ? html`<small>${formatDateTime(o.approved_at)} · ${o.approved_by_name}</small>` : ""}</li>
+                <li class="${o.ordered_at || ["ORDERED", "PARTIALLY_RECEIVED", "RECEIVED"].includes(o.status) ? "done" : ""}">Sent to supplier${o.ordered_at ? html`<small>${formatDateTime(o.ordered_at)}</small>` : ""}</li>
+                <li class="${o.status === "RECEIVED" ? "done" : ""}">Received</li>
+            </ol></section>` : ""}
         ${o.notes ? html`<section class="section"><p class="notes">${o.notes}</p></section>` : ""}
         <section class="section">
             <div class="section-header"><div><h3>Order lines</h3><p>Receive each line as deliveries arrive (partial deliveries allowed)</p></div>
@@ -171,6 +206,7 @@ export async function renderDetail(ctx) {
         },
         receive: async el => {
             const line = item(el);
+            const receiveKey = idempotencyKey();
             const form = formModal({
                 title: `Receive ${line.medicine} ${line.strength || ""}`,
                 intro: `${number(line.quantity_remaining)} of ${number(line.quantity_ordered)} units outstanding at ${money(line.unit_cost)} each. Receiving into an existing batch number adds to that batch.`,
@@ -190,7 +226,7 @@ export async function renderDetail(ctx) {
                 validate: v => (v.quantity_received > line.quantity_remaining
                     ? `Only ${line.quantity_remaining} units are outstanding.` : null),
                 onSubmit: async v => {
-                    const result = await api("/purchase-receipts", { method: "POST", body: {
+                    const result = await api("/purchase-receipts", { method: "POST", headers: { "Idempotency-Key": receiveKey }, body: {
                         ...v, purchase_order_item_id: line.id, location_id: v.location_id ? Number(v.location_id) : null,
                     } });
                     toast(`Received. Batch now holds ${number(result.new_batch_quantity)}; order ${result.purchase_order_status.replaceAll("_", " ").toLowerCase()}.`);
@@ -207,9 +243,30 @@ export async function renderDetail(ctx) {
                 if (result.parsed.expiry_date) form.elements.expiry_date.value = result.parsed.expiry_date;
             });
         },
+        submit: button => busy(button, async () => {
+            await api(`/purchase-orders/${o.id}/submit`, { method: "POST" });
+            toast("Submitted for approval");
+            ctx.reload();
+        }),
+        approve: button => busy(button, async () => {
+            await api(`/purchase-orders/${o.id}/approve`, { method: "POST", body: {} });
+            toast("Order approved");
+            ctx.reload();
+        }),
+        reject: () => formModal({
+            title: `Reject ${o.order_number}`, submitLabel: "Reject to draft",
+            fields: [{ name: "reason", label: "Reason", type: "textarea", required: true, full: true }],
+            onSubmit: async v => { await api(`/purchase-orders/${o.id}/reject`, { method: "POST", body: v }); ctx.reload(); },
+        }),
+        ordered: button => busy(button, async () => {
+            await api(`/purchase-orders/${o.id}/mark-ordered`, { method: "POST" });
+            toast("Marked as sent to the supplier");
+            ctx.reload();
+        }),
         notes: () => formModal({
-            title: "Order notes",
-            fields: [{ name: "notes", label: "Notes", type: "textarea", value: o.notes, full: true }],
+            title: "Order notes and expected delivery",
+            fields: [{ name: "expected_delivery_date", label: "Expected delivery", type: "date", value: o.expected_delivery_date },
+                     { name: "notes", label: "Notes", type: "textarea", value: o.notes, full: true }],
             onSubmit: async v => {
                 await api(`/purchase-orders/${o.id}`, { method: "PUT", body: v });
                 ctx.reload();
@@ -226,5 +283,63 @@ export async function renderDetail(ctx) {
                 ctx.reload();
             },
         }),
+    });
+}
+
+
+/* ---------- Reorder list -> purchase order ---------- */
+
+export async function renderReorder(ctx) {
+    const [rows, suppliers] = await Promise.all([api("/analytics/reorder"), api("/suppliers")]);
+    if (!ctx.isCurrent()) return;
+    const needed = rows.filter(r => r.reorder_recommended);
+    const canOrder = ctx.can("purchasing.write");
+    mount(ctx.main, html`
+        ${pageHeader("Reorder", "Safety stock, reorder point and suggested quantities from current consumption",
+            html`<a class="view-btn" href="#/purchasing">Purchase orders</a>`)}
+        <section class="section">
+            <div class="section-header"><div><h3>${number(needed.length)} medicine(s) need reordering</h3>
+                <p>Suggested quantity = target − usable − on order. Tick the lines to order and choose a supplier.</p></div>
+                ${canOrder && needed.length ? html`<button type="button" class="refresh-btn primary" data-action="create">🛒 Create purchase order</button>` : ""}</div>
+            ${needed.length ? table("reorder-table", [
+                ...(canOrder ? [{ label: "", render: r => html`<input type="checkbox" class="reorder-pick" data-id="${r.medicine_id}" checked
+                    aria-label="Order ${r.medicine}">` }] : []),
+                { label: "Medicine", render: r => html`<a href="#/medicines/${r.medicine_id}"><strong>${r.medicine}</strong></a> <small>${r.strength || ""}</small><br><small>${r.reason}</small>` },
+                { label: "Usable", className: "num", render: r => number(r.usable_stock) },
+                { label: "Daily use", className: "num", render: r => number(r.average_daily_consumption, 2) },
+                { label: "Safety stock", className: "num", render: r => number(r.safety_stock) },
+                { label: "Reorder point", className: "num", render: r => r.reorder_point === null ? "—" : number(r.reorder_point) },
+                { label: "On order", className: "num", render: r => number(r.on_order) },
+                { label: "Order qty", className: "num", render: r => canOrder
+                    ? html`<input type="number" class="qty-input" min="1" step="1" value="${r.recommended_quantity}" data-qty="${r.medicine_id}" aria-label="Quantity">`
+                    : number(r.recommended_quantity) },
+            ], needed) : emptyState("Nothing needs reordering right now.")}
+            <details class="method"><summary>How is this calculated?</summary>
+                <p>${needed[0]?.calculation || "Safety stock = daily use × safety days; reorder point = daily use × lead time + safety stock."}</p></details>
+        </section>`);
+    onAction(ctx.main, {
+        create: () => {
+            const picked = [...ctx.main.querySelectorAll(".reorder-pick:checked")].map(box => ({
+                medicine_id: Number(box.dataset.id),
+                quantity: Number(ctx.main.querySelector(`[data-qty="${box.dataset.id}"]`).value),
+            })).filter(line => line.quantity > 0);
+            if (!picked.length) { toast("Tick at least one medicine.", "warning"); return; }
+            formModal({
+                title: "Create purchase order", submitLabel: "Create draft order",
+                intro: `${picked.length} line(s). Unit costs are taken from the last price paid; you can change them on the order.`,
+                fields: [
+                    { name: "supplier_id", label: "Supplier", type: "select", required: true, placeholder: "Select…",
+                      options: suppliers.filter(s => s.is_active).map(s => ({ value: s.id, label: s.name })) },
+                    { name: "expected_delivery_date", label: "Expected delivery", type: "date", min: today() },
+                    { name: "notes", label: "Notes", type: "textarea", full: true },
+                ],
+                onSubmit: async v => {
+                    const order = await api("/purchase-orders/from-reorder", { method: "POST",
+                        body: { ...v, supplier_id: Number(v.supplier_id), items: picked } });
+                    toast(`Draft order ${order.order.order_number} created`);
+                    ctx.navigate(`purchasing/${order.order.id}`);
+                },
+            });
+        },
     });
 }

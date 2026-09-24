@@ -31,10 +31,14 @@ function validateMedicine(values) {
     return null;
 }
 
-export function openMedicineForm(medicine, onSaved) {
-    const fields = MEDICINE_FIELDS(medicine || {});
+/** prefill: values for a NEW medicine (e.g. the GTIN from a scanned pack). */
+export function openMedicineForm(medicine, onSaved, prefill = {}) {
+    const fields = MEDICINE_FIELDS(medicine || prefill);
     formModal({
         title: medicine ? "Edit Medicine" : "Add Medicine",
+        intro: !medicine && prefill.gtin
+            ? `Barcode ${prefill.gtin} is not registered yet. Check the pack and fill in the details; nothing is looked up from outside sources.`
+            : "",
         fields,
         submitLabel: medicine ? "Save Changes" : "Save Medicine",
         validate: validateMedicine,
@@ -122,6 +126,10 @@ export async function renderList(ctx) {
             if (medicine) openMedicineForm(medicine, () => ctx.reload());
         },
     });
+    // #/medicines?new=1[&gtin=…] (quick action, Scan Center "product not found").
+    if (ctx.params.query.new && canWrite) {
+        openMedicineForm(null, saved => ctx.navigate(`medicines/${saved.id}`), { gtin: ctx.params.query.gtin || "" });
+    }
 }
 
 export async function renderDetail(ctx) {

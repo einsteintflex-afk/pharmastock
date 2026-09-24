@@ -1,20 +1,83 @@
-/* Dashboard: headline figures, expiry, low stock, risk, reorder, movements. */
+/* Dashboard (command center): quick actions, what needs attention, daily
+   brief, then the headline figures, expiry, low stock, risk, reorder and
+   recent activity. */
 
 import {
     api, badge, daysLabel, formatDate, formatDateTime, html, money, mount, movementDirection, number, pageHeader, plural,
     signedQuantity, statTile, table,
 } from "../core.js";
 
+const QUICK_ACTIONS = [
+    { label: "New sale", icon: "🧾", href: "#/dispense", permission: "stock.dispense", tone: "primary" },
+    { label: "Scan Center", icon: "⌗", href: "#/scan", permission: "inventory.read" },
+    { label: "Receive delivery", icon: "📥", href: "#/scan?mode=receive", permission: "purchasing.receive" },
+    { label: "Stock count", icon: "🔢", href: "#/stock-counts", permission: "stock.count", feature: "stock_count" },
+    { label: "Adjust stock", icon: "±", href: "#/adjustments", permission: "stock.adjust", feature: "stock_count" },
+    { label: "Reorder", icon: "🛒", href: "#/reorder", permission: "purchasing.write" },
+    { label: "Add medicine", icon: "💊", href: "#/medicines?new=1", permission: "medicines.write" },
+    { label: "Ask the assistant", icon: "✦", href: "#/assistant", permission: "assistant.use", feature: "ai_assistant" },
+];
+
+const SEVERITY_ICON = { CRITICAL: "⛔", WARNING: "⚠", INFO: "ℹ" };
+
+export function quickActions(ctx) {
+    const actions = QUICK_ACTIONS.filter(a => ctx.can(a.permission) && ctx.hasFeature(a.feature));
+    return html`<nav class="quick-actions" aria-label="Quick actions">
+        ${actions.map(a => html`<a class="quick-action ${a.tone || ""}" href="${a.href}">
+            <span class="qa-icon" aria-hidden="true">${a.icon}</span><span>${a.label}</span></a>`)}
+    </nav>`;
+}
+
+export function attentionList(items) {
+    if (!items.length) {
+        return html`<div class="empty-state"><span aria-hidden="true">✓</span><p>Nothing needs attention right now.</p></div>`;
+    }
+    return html`<ul class="attention-list">
+        ${items.map(i => html`<li class="attention ${i.severity.toLowerCase()}">
+            <span class="attention-icon" aria-hidden="true">${SEVERITY_ICON[i.severity]}</span>
+            <div><strong>${i.title}</strong><small>${i.detail}</small></div>
+            <em class="attention-count">${number(i.count)}</em>
+            <a class="view-btn" href="${i.link}" aria-label="Open: ${i.title}">Open →</a>
+        </li>`)}
+    </ul>`;
+}
+
 export async function render(ctx) {
-    const [data, alerts] = await Promise.all([api("/dashboard"), api("/expiry-alerts")]);
+    const [data, alerts, brief] = await Promise.all([
+        api("/dashboard"), api("/expiry-alerts"), api("/daily-brief").catch(() => null)]);
     if (!ctx.isCurrent()) return;
 
     const t = data.thresholds;
     const expiring = alerts.batches.filter(b => b.status !== "EXPIRED").slice(0, 8);
 
     mount(ctx.main, html`
-        ${pageHeader("Dashboard", `Pharmacy inventory overview · ${formatDate(data.as_of)}`,
+        ${pageHeader(`Good ${new Date().getHours() < 12 ? "morning" : new Date().getHours() < 17 ? "afternoon" : "evening"}, ${ctx.user.full_name.split(" ")[0]}`,
+            `Command center · ${formatDate(data.as_of)}`,
             html`<button type="button" class="refresh-btn" id="dash-refresh">↻ Refresh</button>`)}
+
+        ${quickActions(ctx)}
+
+        ${brief ? html`<div class="lower-grid command-grid">
+            <section class="section">
+                <div class="section-header"><div><h3>What needs attention</h3><p>Most urgent first · only what your role can act on</p></div></div>
+                ${attentionList(brief.attention)}
+            </section>
+            <section class="section brief">
+                <div class="section-header"><div><h3>Daily brief</h3><p>From yesterday's and today's records</p></div></div>
+                <ul class="brief-lines">${brief.summary.map(line => html`<li>${line}</li>`)}</ul>
+                <dl class="summary">
+                    <div><dt>Today so far</dt><dd>${plural(brief.today_so_far.transactions, "sale")} · ${money(brief.today_so_far.sales)}</dd></div>
+                    <div><dt>Yesterday</dt><dd>${plural(brief.yesterday.transactions, "sale")} · ${money(brief.yesterday.sales)}</dd></div>
+                    <div><dt>Same day last week</dt><dd>${plural(brief.same_day_last_week.transactions, "sale")} · ${money(brief.same_day_last_week.sales)}</dd></div>
+                </dl>
+                ${brief.deliveries.length ? html`<h4>Deliveries due</h4>${table("brief-deliveries", [
+                    { label: "Order", render: d => html`<a href="#/purchasing/${d.id}">${d.order_number}</a>` },
+                    { label: "Supplier", key: "supplier" },
+                    { label: "Expected", render: d => html`${formatDate(d.expected_delivery_date)}
+                        ${d.expected_delivery_date < data.as_of ? badge("OVERDUE", "EXPIRED") : ""}` },
+                ], brief.deliveries)}` : ""}
+            </section>
+        </div>` : ""}
 
         <section class="cards" aria-label="Key figures">
             ${statTile("Total Medicines", number(data.total_medicines), "blue", `${data.medicines_in_stock} in stock`, "💊")}

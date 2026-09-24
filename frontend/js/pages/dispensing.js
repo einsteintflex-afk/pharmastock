@@ -1,8 +1,8 @@
 /* Dispensing counter (community pharmacy), history, receipts and voids. */
 
 import {
-    api, badge, debounce, formModal, formatDate, formatDateTime, html, money, mount, number, onAction, openModal,
-    pageHeader, plural, sortableTable, statTile, toast, today,
+    api, badge, busy, debounce, download, formModal, formatDate, formatDateTime, html, idempotencyKey, money, mount,
+    number, onAction, openModal, pageHeader, plural, sortableTable, statTile, toast, today,
 } from "../core.js";
 
 const PAYMENT_LABELS = {
@@ -10,13 +10,11 @@ const PAYMENT_LABELS = {
     CREDIT: "Credit / account", NO_CHARGE: "No charge",
 };
 
-let receiptHeader = { name: "PharmaStock Pharmacy", address: "", phone: "" };
+let receiptHeader = { name: "PharmaStock Pharmacy", address: "", phone: "", has_logo: false };
 
 async function loadReceiptHeader() {
     try {
-        const settings = await api("/settings");
-        const value = key => settings.find(s => s.key === key)?.value || "";
-        receiptHeader = { name: value("pharmacy.name"), address: value("pharmacy.address"), phone: value("pharmacy.phone") };
+        receiptHeader = await api("/branding");
     } catch { /* keep default */ }
 }
 
@@ -27,9 +25,12 @@ function receiptHtml(d) {
     return html`
         <div class="receipt" id="receipt">
             <div class="receipt-head">
+                ${receiptHeader.has_logo ? html`<img class="receipt-logo" src="/branding/logo?v=${receiptHeader.logo_version}" alt="">` : ""}
                 <strong>${receiptHeader.name}</strong>
                 ${receiptHeader.address ? html`<div>${receiptHeader.address}</div>` : ""}
                 ${receiptHeader.phone ? html`<div>Tel: ${receiptHeader.phone}</div>` : ""}
+                ${receiptHeader.email ? html`<div>${receiptHeader.email}</div>` : ""}
+                ${receiptHeader.tax_id ? html`<div>TIN ${receiptHeader.tax_id}</div>` : ""}
             </div>
             ${d.status === "VOIDED" ? html`<div class="receipt-void">VOIDED — ${d.void_reason}</div>` : ""}
             <dl class="receipt-meta">
@@ -51,13 +52,38 @@ function receiptHtml(d) {
                         ${priced ? html`<td class="num">${money(i.unit_price)}</td><td class="num">${money(i.line_total)}</td>` : ""}
                     </tr>`)}</tbody>
             </table>
+            ${Number(d.discount_amount) || Number(d.tax_amount) ? html`<dl class="receipt-sums">
+                <div><dt>Subtotal</dt><dd>${money(d.subtotal_amount)}</dd></div>
+                ${Number(d.discount_amount) ? html`<div><dt>Discount</dt><dd>−${money(d.discount_amount)}</dd></div>` : ""}
+                ${Number(d.tax_amount) ? html`<div><dt>${d.tax_label || "Tax"}</dt><dd>${money(d.tax_amount)}</dd></div>` : ""}
+            </dl>` : ""}
             <div class="receipt-total">
                 <span>Total</span><strong>${money(d.total_amount)}</strong>
             </div>
             <div class="receipt-foot">
                 Paid by: ${PAYMENT_LABELS[d.payment_method] || d.payment_method} · Served by: ${d.dispensed_by}
+                ${receiptHeader.receipt_footer ? html`<div>${receiptHeader.receipt_footer}</div>` : ""}
+                ${receiptHeader.powered_by ? html`<div class="powered">${receiptHeader.powered_by}</div>` : ""}
             </div>
         </div>`;
+}
+
+function receiptActions(d) {
+    return html`<button type="button" class="view-btn" data-receipt="pdf">⬇ PDF</button>
+        <button type="button" class="view-btn" data-receipt="thermal">🧻 Thermal (80 mm)</button>
+        ${d.receipt_token ? html`<button type="button" class="view-btn" data-receipt="link">🔗 Copy digital receipt link</button>` : ""}`;
+}
+
+function wireReceiptActions(root, d) {
+    root.querySelectorAll("[data-receipt]").forEach(button => button.addEventListener("click", () => busy(button, async () => {
+        const kind = button.dataset.receipt;
+        if (kind === "link") {
+            const { url } = await api(`/dispensations/${d.id}/receipt-link`);
+            try { await navigator.clipboard.writeText(url); toast("Receipt link copied"); } catch { toast(url, "info"); }
+        } else {
+            await download(`/dispensations/${d.id}/receipt.pdf`, { layout: kind === "thermal" ? "thermal" : "a4" });
+        }
+    })));
 }
 
 function printReceipt() {
@@ -69,13 +95,17 @@ function printReceipt() {
 }
 
 export function showReceipt(dispensation) {
+    const queued = dispensation.messages_queued || [];
     const body = openModal(`Receipt ${dispensation.dispensation_number}`, html`
         ${receiptHtml(dispensation)}
+        ${queued.length ? html`<p class="method">Sending to the customer: ${queued.map(q => q.replace("_THANK_YOU", " thank-you").toLowerCase()).join(", ")}.</p>` : ""}
         <div class="form-actions receipt-actions">
             <a class="view-btn" href="#/dispensations/${dispensation.id}">Open record</a>
-            <button type="button" class="refresh-btn primary" data-print="1">Print receipt</button>
+            ${receiptActions(dispensation)}
+            <button type="button" class="refresh-btn primary" data-print="1">🖨 Print receipt</button>
         </div>`);
     body.querySelector("[data-print]").addEventListener("click", printReceipt);
+    wireReceiptActions(body, dispensation);
 }
 
 /* ---------- Counter ---------- */
@@ -131,6 +161,17 @@ export async function renderCounter(ctx) {
                 ${activeLocations.length > 1 ? html`<div class="field"><label for="c-location">Dispense from</label>
                     <select id="c-location" name="location_id"><option value="">Any location</option>
                     ${activeLocations.map(l => html`<option value="${l.id}">${l.name}</option>`)}</select></div>` : ""}
+                <div class="field"><label for="c-discount">Discount</label>
+                    <div class="inline-inputs"><input id="c-discount" name="discount" type="number" min="0" step="0.01" placeholder="0">
+                    <select name="discount_kind" aria-label="Discount type"><option value="amount">amount</option><option value="percent">%</option></select></div></div>
+                <div class="field"><label for="c-email">Customer e-mail</label><input id="c-email" name="customer_email" type="email" maxlength="150" placeholder="Optional"></div>
+                <fieldset class="field full consent">
+                    <legend>The customer agrees to receive the receipt by</legend>
+                    <label><input type="checkbox" name="consent_whatsapp"> WhatsApp</label>
+                    <label><input type="checkbox" name="consent_sms"> SMS</label>
+                    <label><input type="checkbox" name="consent_email"> E-mail</label>
+                    <small class="help">Ask the customer first. Messages are only sent if your pharmacy has turned them on (Settings → Messaging).</small>
+                </fieldset>
                 <div class="field full"><label for="c-notes">Notes</label><input id="c-notes" name="notes" maxlength="500" placeholder="Optional"></div>
                 <div class="form-error full" role="alert" hidden></div>
                 <div class="form-actions full">
@@ -293,10 +334,21 @@ export async function renderCounter(ctx) {
         if (type === "PRESCRIPTION" && !f.prescriber.value.trim() && !f.prescription_number.value.trim()) {
             return fail("Enter the prescriber or the prescription number.");
         }
+        if ((f.consent_whatsapp.checked || f.consent_sms.checked) && !f.patient_phone.value.trim()) {
+            return fail("Enter the customer's phone number to send the receipt by WhatsApp / SMS.");
+        }
+        if (f.consent_email.checked && !f.customer_email.value.trim()) return fail("Enter the customer's e-mail address.");
+        const discount = Number(f.discount.value || 0);
         const button = form.querySelector("button[type=submit]");
         button.disabled = true;
+        // One key per sale attempt: a retry after a network error cannot sell twice.
+        form.dataset.key = form.dataset.key || idempotencyKey();
         try {
-            const result = await api("/dispensations", { method: "POST", body: {
+            const result = await api("/dispensations", { method: "POST", headers: { "Idempotency-Key": form.dataset.key }, body: {
+                discount_amount: discount && f.discount_kind.value === "amount" ? discount : null,
+                discount_percent: discount && f.discount_kind.value === "percent" ? discount : null,
+                customer_email: f.customer_email.value.trim() || null,
+                consent: { whatsapp: f.consent_whatsapp.checked, sms: f.consent_sms.checked, email: f.consent_email.checked },
                 dispense_type: type,
                 payment_method: f.payment_method.value,
                 patient_name: f.patient_name.value.trim() || null,
@@ -311,6 +363,7 @@ export async function renderCounter(ctx) {
                     directions: l.directions.trim() || null,
                 })),
             } });
+            delete form.dataset.key;
             toast(`Dispensed ${result.dispensation_number} · ${money(result.total_amount)}`);
             // Update local stock figures so the next customer sees current stock.
             result.items.forEach(item => {
@@ -328,6 +381,8 @@ export async function renderCounter(ctx) {
                 }
             }).catch(() => {});
         } catch (error) {
+            // Keep the key only when the request may have reached the server.
+            if (error.status !== 0) delete form.dataset.key;
             fail(error.message);
         } finally {
             button.disabled = false;
@@ -407,7 +462,8 @@ export async function renderDetail(ctx) {
     mount(ctx.main, html`
         ${pageHeader(`Dispensation ${d.dispensation_number}`, `${formatDateTime(d.dispensed_at)} · ${d.dispensed_by}`, html`
             <a class="view-btn" href="#/dispensations">← History</a>
-            <button type="button" class="refresh-btn" data-action="print">Print receipt</button>
+            ${receiptActions(d)}
+            <button type="button" class="refresh-btn" data-action="print">🖨 Print receipt</button>
             ${canVoid ? html`<button type="button" class="refresh-btn danger" data-action="void">Void</button>` : ""}`)}
         <section class="section receipt-page">
             ${d.status === "VOIDED" ? html`<p class="warning-text">Voided ${formatDateTime(d.voided_at)} by ${d.voided_by_name}: ${d.void_reason}. The stock was returned to its batches.</p>` : ""}
@@ -415,6 +471,7 @@ export async function renderDetail(ctx) {
             ${d.notes ? html`<p class="notes">Notes: ${d.notes}</p>` : ""}
         </section>`);
 
+    wireReceiptActions(ctx.main, d);
     onAction(ctx.main, {
         print: printReceipt,
         void: () => formModal({

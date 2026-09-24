@@ -36,6 +36,18 @@
                 <button type="button" class="link-btn" id="show-forgot">Forgot your password?</button>
             </form>
 
+            <form id="mfa-form" hidden autocomplete="off">
+                <h2>Two-step verification</h2>
+                <p class="form-intro">Enter the 6-digit code from your authenticator app. Lost your phone? Enter one of your recovery codes.</p>
+                <div class="field">
+                    <label for="mfa-login-code">Code</label>
+                    <input id="mfa-login-code" name="code" inputmode="numeric" autocomplete="one-time-code" required maxlength="20">
+                </div>
+                <div id="mfa-error" class="form-error" role="alert" hidden></div>
+                <button type="submit" class="refresh-btn primary">Verify</button>
+                <button type="button" class="link-btn" data-back-to-login>Back to sign in</button>
+            </form>
+
             <form id="forgot-form" hidden>
                 <h2>Reset your password</h2>
                 <p class="form-intro">Enter your username. If your account has an e-mail address, a one-time reset link is sent to it.
@@ -64,6 +76,7 @@
                 <button type="submit" class="refresh-btn primary">Set password</button>
                 <button type="button" class="link-btn" data-back-to-login>Back to sign in</button>
             </form>
+            <p class="powered-by">Powered by <strong>MedCart Tech</strong></p>
         </div>
     </main>
 
@@ -93,6 +106,7 @@
 
             <div class="sidebar-bottom">
                 <nav id="nav-admin" aria-label="Administration"></nav>
+                <p class="powered-by sidebar-powered">Powered by <strong>MedCart Tech</strong></p>
                 <div id="system-status" class="system-status">
                     <span class="status-dot" aria-hidden="true"></span>
                     <div>
@@ -104,7 +118,15 @@
         </aside>
 
         <div class="content">
-            <div class="session-bar" id="user-box"></div>
+            <div class="session-bar">
+                <form class="global-search" id="global-search" role="search">
+                    <label class="sr-only" for="global-search-input">Search</label>
+                    <input id="global-search-input" type="search" placeholder="Search medicines, batches, orders, sales…  ( / )"
+                           autocomplete="off" aria-controls="global-search-results" aria-expanded="false">
+                    <div class="search-results" id="global-search-results" hidden></div>
+                </form>
+                <div class="session-user" id="user-box"></div>
+            </div>
             <main id="main" class="main" tabindex="-1"></main>
         </div>
     </div>

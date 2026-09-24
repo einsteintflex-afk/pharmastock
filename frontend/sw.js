@@ -3,7 +3,7 @@
    starts quickly and shows a clear message when the server is unreachable.
    API data is never cached: it is private and must always be current. */
 
-const VERSION = "pharmastock-shell-v1";
+const VERSION = "pharmastock-shell-v2";
 
 self.addEventListener("install", event => {
     event.waitUntil(caches.open(VERSION).then(cache => cache.addAll([
