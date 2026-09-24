@@ -21,11 +21,14 @@ from ..services import delivery, plans
 
 router = APIRouter(tags=["Users"])
 
-RoleName = Literal["ADMINISTRATOR", "MANAGER", "PHARMACIST", "PHARMACY_TECHNICIAN", "STOREKEEPER", "VIEWER"]
+RoleName = Literal["OWNER", "ADMINISTRATOR", "MANAGER", "PHARMACIST", "PHARMACY_TECHNICIAN", "STOREKEEPER",
+                   "VIEWER", "INVENTORY_OFFICER", "PURCHASING_OFFICER", "CASHIER", "AUDITOR"]
+# Roles that count as "an administrator" for the last-administrator rule.
+_ADMIN = ("OWNER", "ADMINISTRATOR")
 
 USER_COLUMNS = """
     id, username, full_name, email, role, is_active, must_change_password,
-    last_login_at, created_at, updated_at, locked_until, location_id, is_platform_admin
+    last_login_at, created_at, updated_at, locked_until, location_id, is_platform_admin, mfa_enabled
 """
 
 
@@ -65,9 +68,16 @@ def _get(conn, user_id: int, organization_id: int) -> dict:
 
 def _active_admins(conn, organization_id: int) -> int:
     return conn.execute(
-        "SELECT COUNT(*) AS n FROM users WHERE role = 'ADMINISTRATOR' AND is_active AND organization_id = %s",
-        (organization_id,),
+        "SELECT COUNT(*) AS n FROM users WHERE role = ANY(%s) AND is_active AND organization_id = %s",
+        (list(_ADMIN), organization_id),
     ).fetchone()["n"]
+
+
+def _check_owner_rule(user: CurrentUser, *roles: str) -> None:
+    """Only an owner can create, promote to, change or demote an owner:
+    an administrator cannot take over the organization's billing."""
+    if "OWNER" in roles and user.role != "OWNER":
+        raise HTTPException(status_code=403, detail="Only an organization owner can assign or change the owner role.")
 
 
 def _check_location(conn, location_id: int | None) -> None:
@@ -103,6 +113,7 @@ def list_users(user: CurrentUser = Depends(require("users.manage")),
 def create_user(body: UserCreate, user: CurrentUser = Depends(require("users.manage")),
                 conn: psycopg.Connection = Depends(get_db)):
     validate_password_strength(body.password, body.username)
+    _check_owner_rule(user, body.role)
     _check_location(conn, body.location_id)
     active = conn.execute(
         "SELECT COUNT(*) AS n FROM users WHERE organization_id = %s AND is_active", (user.organization_id,)
@@ -135,13 +146,15 @@ def create_user(body: UserCreate, user: CurrentUser = Depends(require("users.man
 def update_user(user_id: int, body: UserUpdate, user: CurrentUser = Depends(require("users.manage")),
                 conn: psycopg.Connection = Depends(get_db)):
     old = _get(conn, user_id, user.organization_id)
+    if body.role != old["role"] or not body.is_active:
+        _check_owner_rule(user, body.role, old["role"])
     _check_location(conn, body.location_id)
 
     if user_id == user.id and (not body.is_active or body.role != old["role"]):
         raise HTTPException(status_code=400, detail="You cannot deactivate yourself or change your own role")
 
-    removing_admin = old["role"] == "ADMINISTRATOR" and old["is_active"] and (
-        body.role != "ADMINISTRATOR" or not body.is_active
+    removing_admin = old["role"] in _ADMIN and old["is_active"] and (
+        body.role not in _ADMIN or not body.is_active
     )
     if removing_admin and _active_admins(conn, user.organization_id) <= 1:
         raise HTTPException(status_code=400, detail="At least one active administrator is required")
@@ -171,6 +184,7 @@ def update_user(user_id: int, body: UserUpdate, user: CurrentUser = Depends(requ
 def reset_password(user_id: int, body: PasswordReset, user: CurrentUser = Depends(require("users.manage")),
                    conn: psycopg.Connection = Depends(get_db)):
     target = _get(conn, user_id, user.organization_id)
+    _check_owner_rule(user, target["role"])
     temporary = body.temporary_password or (secrets.token_urlsafe(9) + "7a")
     validate_password_strength(temporary, target["username"])
 
@@ -200,6 +214,7 @@ def create_reset_link(user_id: int, body: ResetLinkRequest, request: Request,
     """One-time link (24 hours) with which the user sets their own password;
     the administrator never learns it. E-mailed when the user has an address."""
     target = _get(conn, user_id, user.organization_id)
+    _check_owner_rule(user, target["role"])
     token, expires_at = create_reset_token(conn, user_id, "ADMIN_RESET", user.id, 24)
     base = settings.app_base_url or str(request.base_url).rstrip("/")
     link = f"{base}/app/#/reset-password?token={token}"
@@ -240,3 +255,26 @@ def revoke_user_sessions(user_id: int, user: CurrentUser = Depends(require("user
     audit.record(conn, user, "REVOKE_SESSIONS", "user", user_id)
     conn.commit()
     return {"message": "Sessions revoked"}
+
+
+@router.post("/users/{user_id}/reset-mfa")
+def reset_user_mfa(user_id: int, user: CurrentUser = Depends(require("users.manage")),
+                   conn: psycopg.Connection = Depends(get_db)):
+    """For a user who lost their authenticator and recovery codes: MFA is
+    switched off and their sessions end; they must set it up again."""
+    target = _get(conn, user_id, user.organization_id)
+    _check_owner_rule(user, target["role"])
+    if user_id == user.id:
+        raise HTTPException(status_code=400, detail="Use your own security settings to change your MFA")
+    conn.execute(
+        """
+        UPDATE users SET mfa_enabled = false, mfa_secret_encrypted = NULL, mfa_recovery_codes = NULL,
+               mfa_enabled_at = NULL, mfa_last_counter = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = %s AND organization_id = %s
+        """,
+        (user_id, user.organization_id),
+    )
+    revoke_all_sessions(conn, user_id)
+    audit.record(conn, user, "MFA_RESET", "user", user_id)
+    conn.commit()
+    return {"message": "Two-step verification was reset; the user must set it up again"}

@@ -1,30 +1,31 @@
 -- ============================================================
--- APPLICATION DATABASE ROLE
+-- LEAST-PRIVILEGE DATABASE ROLES (existing installations)
 -- ============================================================
--- Tenant isolation is enforced by PostgreSQL row level security. Superusers
--- and roles with BYPASSRLS ignore those policies, so the application must
--- connect as an ordinary role. In production the server refuses to start
--- otherwise.
+-- Tenant isolation is enforced by PostgreSQL row level security, which
+-- superusers and BYPASSRLS roles ignore. PharmaStock therefore uses:
 --
--- Run once as a superuser (psql -v app_password='...' -f create_app_role.sql
--- -d pharmastock). The role owns the schema so it can apply migrations;
--- FORCE ROW LEVEL SECURITY makes the policies apply to the owner as well.
+--   * an OWNER role that owns the schema and applies migrations
+--     (MIGRATION_DATABASE_URL), e.g. the role that owns the database today;
+--   * an APPLICATION role (DATABASE_URL) with row privileges only: it cannot
+--     create, alter or drop tables, cannot bypass row level security, and can
+--     only INSERT / SELECT the audit trails (append-only).
+--
+-- Run once as a superuser:
+--   psql -v app_password='...' -f deploy/create_app_role.sql -d pharmastock
+-- then apply migrations as the owner with APP_DB_ROLE=pharmastock_app, which
+-- (re)grants the application role's privileges on every table:
+--   MIGRATION_DATABASE_URL=postgresql://<owner>:<pw>@host/pharmastock \
+--   APP_DB_ROLE=pharmastock_app python -m backend.migrate
+-- and run the server with
+--   DATABASE_URL=postgresql://pharmastock_app:<pw>@host/pharmastock
+--
+-- Installations where pharmastock_app already OWNS the schema (earlier
+-- versions of this script): create a new owner role, transfer ownership to
+-- it (ALTER ... OWNER TO), then follow the steps above. See docs/DEPLOYMENT.md.
 
 \set ON_ERROR_STOP on
 
 CREATE ROLE pharmastock_app LOGIN PASSWORD :'app_password'
     NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
-
--- Hand the database and every object in the public schema to the role.
-SELECT format('ALTER DATABASE %I OWNER TO pharmastock_app', current_database()) \gexec
-ALTER SCHEMA public OWNER TO pharmastock_app;
-SELECT format('ALTER TABLE public.%I OWNER TO pharmastock_app', tablename)
-FROM pg_tables WHERE schemaname = 'public' \gexec
-SELECT format('ALTER SEQUENCE public.%I OWNER TO pharmastock_app', sequencename)
-FROM pg_sequences WHERE schemaname = 'public' \gexec
-SELECT format('ALTER VIEW public.%I OWNER TO pharmastock_app', viewname)
-FROM pg_views WHERE schemaname = 'public' \gexec
-SELECT format('ALTER FUNCTION %s OWNER TO pharmastock_app', p.oid::regprocedure)
-FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' \gexec
-
--- Then set DATABASE_URL=postgresql://pharmastock_app:<password>@host:5432/pharmastock
+SELECT format('GRANT CONNECT ON DATABASE %I TO pharmastock_app', current_database()) \gexec
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;

@@ -6,9 +6,10 @@ from datetime import date
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
+from .. import idempotency
 from ..database import get_db
 from ..schemas import LongText, Name150, Phone, Text255, blank_to_none
 from ..security import CurrentUser, require
@@ -41,14 +42,19 @@ class VoidRequest(BaseModel):
 
 
 @router.post("/dispensations", status_code=201)
-def create_dispensation(body: DispensationCreate, user: CurrentUser = Depends(require("stock.dispense")),
+def create_dispensation(body: DispensationCreate, request: Request,
+                        user: CurrentUser = Depends(require("stock.dispense")),
                         conn: psycopg.Connection = Depends(get_db)):
+    replay = idempotency.begin(conn, user, request, body)
+    if replay:
+        return replay
     data = body.model_dump()
     for key in ("patient_name", "patient_phone", "prescriber", "prescription_number", "notes"):
         data[key] = blank_to_none(data[key])
     for item in data["items"]:
         item["directions"] = blank_to_none(item["directions"])
     result = dispensing.create(conn, user, data)
+    idempotency.finish(conn, request, result, 201)
     conn.commit()
     return result
 

@@ -22,7 +22,7 @@ from ..security import CurrentUser
 from . import app_settings, notifications, stock
 
 OPEN_STATUSES = ("REQUESTED", "APPROVED", "DISPATCHED")
-UNSCOPED_ROLES = ("ADMINISTRATOR", "MANAGER")
+UNSCOPED_ROLES = ("OWNER", "ADMINISTRATOR", "MANAGER")
 
 
 def _scoped_location(user: CurrentUser) -> int | None:

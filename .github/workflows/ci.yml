@@ -32,7 +32,8 @@ jobs:
         run: |
           # The service superuser creates an ordinary role for the tests.
           PGPASSWORD=pharma_dev psql -h localhost -U pharma -d postgres -c \
-            "CREATE ROLE tester LOGIN PASSWORD 'tester' CREATEDB NOSUPERUSER NOBYPASSRLS"
+            "CREATE ROLE tester LOGIN PASSWORD 'tester' CREATEDB CREATEROLE NOSUPERUSER NOBYPASSRLS"
+          # The API under test runs as a separate restricted role the fixtures create.
           TEST_DATABASE_URL=postgresql://tester:tester@localhost:5432/pharmastock_test pytest -q -p no:warnings
 
   frontend:

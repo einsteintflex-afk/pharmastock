@@ -21,7 +21,7 @@ from fastapi import Depends, HTTPException, Request
 
 from .config import settings
 from .database import get_db, set_organization
-from .permissions import permissions_for
+from .permissions import ADMIN_ROLES, permissions_for
 from .services import plans
 
 SESSION_COOKIE = "pharmastock_session"
@@ -95,17 +95,25 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def session_hours(privileged: bool) -> int:
+    return min(settings.session_hours, settings.platform_session_hours) if privileged else settings.session_hours
+
+
 def create_session(conn: psycopg.Connection, user_id: int, request: Request,
-                   client_name: str | None = None) -> tuple[str, datetime]:
+                   client_name: str | None = None, *, privileged: bool = False,
+                   mfa_verified: bool = False) -> tuple[str, datetime]:
+    """privileged: platform administrators get shorter sessions.
+    mfa_verified: the sign-in included a second factor."""
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now() + timedelta(hours=settings.session_hours)
+    expires_at = datetime.now() + timedelta(hours=session_hours(privileged))
     conn.execute(
         """
-        INSERT INTO sessions (user_id, token_hash, expires_at, ip_address, user_agent, client_name)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO sessions (user_id, token_hash, expires_at, ip_address, user_agent, client_name,
+                              privileged, mfa_verified_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN CURRENT_TIMESTAMP END)
         """,
         (user_id, _hash_token(token), expires_at, client_ip(request),
-         (request.headers.get("user-agent") or "")[:255], client_name),
+         (request.headers.get("user-agent") or "")[:255], client_name, privileged, mfa_verified),
     )
     return token, expires_at
 
@@ -178,6 +186,12 @@ class CurrentUser:
     is_platform_admin: bool = False
     location_id: int | None = None
     features: set[str] = field(default_factory=set)
+    session_id: int | None = None
+    mfa_enabled: bool = False
+    # When this session last proved a second factor (sign-in or step-up).
+    mfa_verified_at: datetime | None = None
+    # The organization requires MFA for this role and it is not set up yet.
+    mfa_setup_required: bool = False
 
     def can(self, permission: str) -> bool:
         return permission in self.permissions
@@ -196,7 +210,7 @@ def get_current_user(request: Request, conn: psycopg.Connection = Depends(get_db
                users.is_platform_admin, users.location_id,
                organizations.name AS organization_name, organizations.org_type,
                organizations.plan, organizations.limits, organizations.status AS organization_status,
-               sessions.id AS session_id, sessions.expires_at
+               users.mfa_enabled, sessions.id AS session_id, sessions.expires_at, sessions.mfa_verified_at
         FROM sessions
         JOIN users ON users.id = sessions.user_id
         JOIN organizations ON organizations.id = users.organization_id
@@ -234,9 +248,24 @@ def get_current_user(request: Request, conn: psycopg.Connection = Depends(get_db
         is_platform_admin=row["is_platform_admin"],
         location_id=row["location_id"],
         features=set(plans.effective({"plan": row["plan"], "limits": row["limits"]})["features"]),
+        session_id=row["session_id"],
+        mfa_enabled=row["mfa_enabled"],
+        mfa_verified_at=row["mfa_verified_at"],
     )
+    user.mfa_setup_required = mfa_required_for(conn, user) and not user.mfa_enabled
     request.state.user = user
     return user
+
+
+def mfa_required_for(conn: psycopg.Connection, user: "CurrentUser") -> bool:
+    """Platform administrators always; organization administrators when the
+    organization turns on security.require_mfa_for_admins."""
+    if user.is_platform_admin:
+        return False  # enforced on the platform endpoints (require_platform_admin), not on company work
+    if user.role not in ADMIN_ROLES:
+        return False
+    from .services import app_settings
+    return bool(app_settings.get(conn, "security.require_mfa_for_admins"))
 
 
 def require(permission: str):
@@ -247,6 +276,12 @@ def require(permission: str):
         if user.must_change_password:
             raise HTTPException(
                 status_code=403, detail="You must change your password before continuing."
+            )
+        if user.mfa_setup_required:
+            raise HTTPException(
+                status_code=403,
+                detail="Your organization requires two-step verification for your role. "
+                       "Set it up under My account → Security before continuing.",
             )
         if not user.can(permission):
             raise HTTPException(
@@ -272,6 +307,23 @@ def require_feature(feature: str, permission: str = "inventory.read"):
 
 
 def require_platform_admin(user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+    """Platform (MedCart Tech) console: platform administrator, signed in with
+    two-step verification in this session."""
     if user.must_change_password or not user.is_platform_admin:
         raise HTTPException(status_code=403, detail="Platform administrator access required.")
+    if not user.mfa_enabled:
+        raise HTTPException(status_code=403, detail="Platform access requires two-step verification. "
+                                                    "Set it up under My account → Security.")
+    if user.mfa_verified_at is None:
+        raise HTTPException(status_code=403, detail="Sign in again with your authenticator code to use "
+                                                    "the platform console.")
+    return user
+
+
+def require_step_up(user: CurrentUser = Depends(require_platform_admin)) -> CurrentUser:
+    """High-risk platform actions: a second factor within the last few minutes."""
+    fresh = datetime.now() - timedelta(minutes=settings.step_up_minutes)
+    if user.mfa_verified_at is None or user.mfa_verified_at < fresh:
+        raise HTTPException(status_code=403, detail="step_up_required: confirm with your authenticator code "
+                                                    "to continue.")
     return user

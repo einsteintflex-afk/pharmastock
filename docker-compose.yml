@@ -12,6 +12,7 @@ services:
     environment:
       POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD}
+      OWNER_DB_PASSWORD: ${OWNER_DB_PASSWORD:?set OWNER_DB_PASSWORD}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD}
       BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set BACKUP_DB_PASSWORD}
     volumes:
@@ -32,7 +33,10 @@ services:
       db: { condition: service_healthy }
     env_file: ${APP_ENV_FILE:-.env.production}
     environment:
+      # Runs as the restricted application role; migrations run as the owner.
       DATABASE_URL: postgresql://pharmastock_app:${APP_DB_PASSWORD}@db:5432/pharmastock
+      MIGRATION_DATABASE_URL: postgresql://pharmastock_owner:${OWNER_DB_PASSWORD}@db:5432/pharmastock
+      APP_DB_ROLE: pharmastock_app
     networks: [internal]
 
   proxy:

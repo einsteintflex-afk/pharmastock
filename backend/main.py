@@ -21,14 +21,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import database, observability
+from . import database, observability, security_events
 from .config import settings
 from .migrate import pending_migrations
 from .ratelimit import SlidingWindow
 from .security import SESSION_COOKIE, client_ip, request_token
 from .routers import (
     admin, analytics, assistant, auth, barcode, delivery, dispensing, inventory, medicines, organizations,
-    purchasing, reports, stock, suppliers, transfers, users,
+    platform, purchasing, reports, stock, suppliers, transfers, users,
 )
 from .services import delivery as delivery_service
 from .services import notifications, scheduler
@@ -128,6 +128,17 @@ def _process_deliveries() -> None:
         logger.exception("Delivery worker failed")
 
 
+def _check_secret_key() -> None:
+    if settings.secret_key and len(settings.secret_key) >= 32:
+        return
+    message = ("SECRET_KEY is not set (or shorter than 32 characters). It encrypts stored secrets such as "
+               "two-step verification keys and messaging provider credentials. Generate one with: "
+               "python -c \"import secrets; print(secrets.token_urlsafe(48))\"")
+    if settings.is_production:
+        raise RuntimeError(message)
+    logger.warning(message + " (development: a key derived from DATABASE_URL is used)")
+
+
 def _check_database_role() -> None:
     """Row level security does not apply to superusers / BYPASSRLS roles."""
     with database.connect() as conn:
@@ -157,6 +168,7 @@ async def _delivery_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _check_migrations()
+    _check_secret_key()
     _check_database_role()
     _bootstrap_admin()
     database.open_pool()
@@ -223,6 +235,28 @@ def _guard(request: Request) -> JSONResponse | None:
     return None
 
 
+async def _security_event(request: Request, status: int) -> None:
+    path = request.scope["path"]
+    if status < 400 or path.startswith(UNLIMITED_PREFIXES):
+        return
+    user = getattr(request.state, "user", None)
+    if path == "/auth/login" and request.method == "POST" and status in (401, 423):
+        event = "LOGIN_FAILED" if status == 401 else "LOGIN_LOCKED"
+    elif status == 403 and request.method in UNSAFE_METHODS and user is None \
+            and request.headers.get("x-requested-with") != "PharmaStock":
+        event = "CSRF_REFUSED"
+    else:
+        event = security_events.classify(request.method, path, status, bool(request_token(request)))
+    if event is None:
+        return
+    await asyncio.to_thread(
+        security_events.record, event,
+        organization_id=user.organization_id if user else None, user_id=user.id if user else None,
+        username=user.username if user else None, method=request.method, path=path, status_code=status,
+        ip=client_ip(request), request_id=getattr(request.state, "request_id", None),
+    )
+
+
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     request_id = uuid.uuid4().hex[:12]
@@ -242,6 +276,7 @@ async def request_context(request: Request, call_next):
         raise
 
     elapsed = time.perf_counter() - started
+    await _security_event(request, response.status_code)
     route = request.scope.get("route")
     observability.metrics.observe(request.method, getattr(route, "path", "unmatched"), response.status_code,
                                   elapsed)
@@ -386,7 +421,7 @@ def metrics(request: Request):
     return Response(observability.metrics.render(extra), media_type="text/plain; version=0.0.4")
 
 
-for module in (auth, users, organizations, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,
+for module in (auth, users, organizations, platform, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,
                analytics, reports, delivery, admin, assistant):
     app.include_router(module.router)
 

@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import psycopg
+import psycopg.sql
 from psycopg.rows import tuple_row
 
 from .config import settings
@@ -40,6 +41,11 @@ def _checksum(path: Path) -> str:
 
 
 def _ensure_table(connection: psycopg.Connection) -> None:
+    # The application role may not create tables: only create when missing.
+    exists = connection.cursor(row_factory=tuple_row).execute(
+        "SELECT to_regclass('public.schema_migrations') IS NOT NULL").fetchone()[0]
+    if exists:
+        return
     connection.execute("""
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version varchar(20) PRIMARY KEY,
@@ -83,11 +89,36 @@ def pending_migrations(connection: psycopg.Connection) -> list[str]:
     return pending
 
 
-def migrate(database_url: str | None = None) -> list[str]:
-    """Apply all pending migrations. Returns the versions applied."""
-    applied_now = []
+# Least privilege: migrations run as the schema OWNER (MIGRATION_DATABASE_URL);
+# the application connects as a separate role that can only read and write
+# rows. The audit trails are append-only for it, and it can never change the
+# schema or the migration history.
+_APPEND_ONLY = ("audit_log", "platform_audit", "security_events")
 
-    with psycopg.connect(database_url or settings.database_url) as connection:
+
+def grant_app_role(connection: psycopg.Connection, role: str) -> None:
+    """(Re)apply the application role's privileges after migrations."""
+    ident = psycopg.sql.Identifier(role)
+    statements = [
+        "GRANT USAGE ON SCHEMA public TO {r}",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {r}",
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {r}",
+        "REVOKE INSERT, UPDATE, DELETE ON schema_migrations FROM {r}",
+        "REVOKE UPDATE, DELETE ON " + ", ".join(_APPEND_ONLY) + " FROM {r}",
+        "REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public FROM {r}",
+    ]
+    with connection.transaction():
+        for statement in statements:
+            connection.execute(psycopg.sql.SQL(statement).format(r=ident))
+
+
+def migrate(database_url: str | None = None, app_role: str | None = None) -> list[str]:
+    """Apply all pending migrations (as the schema owner) and grant the
+    application role its row-level privileges. Returns the versions applied."""
+    applied_now = []
+    app_role = app_role if app_role is not None else settings.app_db_role
+
+    with psycopg.connect(database_url or settings.migration_database_url or settings.database_url) as connection:
         _ensure_table(connection)
         applied = _applied(connection)
 
@@ -124,11 +155,15 @@ def migrate(database_url: str | None = None) -> list[str]:
 
             applied_now.append(f"{version}_{name}")
 
+        if app_role:
+            grant_app_role(connection, app_role)
+            logger.info("Privileges granted to application role %s", app_role)
+
     return applied_now
 
 
 def status(database_url: str | None = None) -> list[dict]:
-    with psycopg.connect(database_url or settings.database_url) as connection:
+    with psycopg.connect(database_url or settings.migration_database_url or settings.database_url) as connection:
         _ensure_table(connection)
         rows = connection.execute(
             "SELECT version, name, applied_at, stamped FROM schema_migrations"

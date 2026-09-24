@@ -14,10 +14,10 @@
 from datetime import date
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from .. import audit
+from .. import audit, idempotency
 from ..database import get_db
 from ..schemas import Code50, Code100, LongText, Name150, blank_to_none
 from ..security import CurrentUser, require
@@ -402,9 +402,12 @@ def delete_purchase_order_item(purchase_order_id: int, item_id: int,
 # ------------------------------------------------------------
 
 @router.post("/purchase-receipts")
-def receive_purchase_order_item(receipt: PurchaseReceiptCreate,
+def receive_purchase_order_item(receipt: PurchaseReceiptCreate, request: Request,
                                 user: CurrentUser = Depends(require("purchasing.receive")),
                                 conn: psycopg.Connection = Depends(get_db)):
+    replay = idempotency.begin(conn, user, request, receipt)
+    if replay:
+        return replay
     item = conn.execute(
         """
         SELECT poi.id, poi.purchase_order_id, poi.medicine_id, poi.quantity_ordered,
@@ -526,9 +529,7 @@ def receive_purchase_order_item(receipt: PurchaseReceiptCreate,
         entity_type="purchase_order", entity_id=item["purchase_order_id"],
         key=f"receipt:{receipt_row['id']}",
     )
-    conn.commit()
-
-    return {
+    result = {
         "message": "Stock received successfully",
         "receipt_id": receipt_row["id"],
         "purchase_order_item_id": item["id"],
@@ -540,6 +541,9 @@ def receive_purchase_order_item(receipt: PurchaseReceiptCreate,
         "movement_type": "RECEIVED",
         "purchase_order_status": new_status,
     }
+    idempotency.finish(conn, request, result)
+    conn.commit()
+    return result
 
 
 @router.get("/purchase-receipts")

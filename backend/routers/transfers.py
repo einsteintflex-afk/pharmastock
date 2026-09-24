@@ -6,9 +6,10 @@
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from .. import idempotency
 from ..database import get_db
 from ..pagination import set_total
 from ..schemas import LongText, blank_to_none
@@ -117,16 +118,28 @@ def cancel_transfer(transfer_id: int, body: Reason, user: CurrentUser = Depends(
 
 
 @router.post("/transfers/{transfer_id}/dispatch")
-def dispatch_transfer(transfer_id: int, user: CurrentUser = Depends(_need("transfers.dispatch")),
+def dispatch_transfer(transfer_id: int, request: Request,
+                      user: CurrentUser = Depends(_need("transfers.dispatch")),
                       conn: psycopg.Connection = Depends(get_db)):
+    replay = idempotency.begin(conn, user, request)
+    if replay:
+        return replay
     transfers.dispatch(conn, user, transfer_id)
+    result = transfers.detail(conn, transfer_id)
+    idempotency.finish(conn, request, result)
     conn.commit()
-    return transfers.detail(conn, transfer_id)
+    return result
 
 
 @router.post("/transfers/{transfer_id}/receive")
-def receive_transfer(transfer_id: int, user: CurrentUser = Depends(_need("transfers.receive")),
+def receive_transfer(transfer_id: int, request: Request,
+                     user: CurrentUser = Depends(_need("transfers.receive")),
                      conn: psycopg.Connection = Depends(get_db)):
+    replay = idempotency.begin(conn, user, request)
+    if replay:
+        return replay
     transfers.receive(conn, user, transfer_id)
+    result = transfers.detail(conn, transfer_id)
+    idempotency.finish(conn, request, result)
     conn.commit()
-    return transfers.detail(conn, transfer_id)
+    return result

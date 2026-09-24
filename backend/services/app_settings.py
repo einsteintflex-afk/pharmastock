@@ -20,6 +20,25 @@ SETTING_RULES = {
     "pharmacy.address": (str, 0, 255),
     "pharmacy.phone": (str, 0, 50),
     "transfers.separate_approver": (bool, None, None),
+    "company.email": (str, 0, 150),
+    "company.website": (str, 0, 150),
+    "company.registration_number": (str, 0, 60),
+    "company.tax_id": (str, 0, 60),
+    "receipt.footer": (str, 0, 300),
+    "receipt.tax_rate_percent": (float, 0, 100),
+    "receipt.tax_label": (str, 1, 30),
+    "receipt.show_batches": (bool, None, None),
+    "report.footer": (str, 0, 300),
+    "adjustments.approval_quantity_threshold": (int, 0, 1_000_000),
+    "adjustments.approval_value_threshold": (float, 0, 1_000_000_000),
+    "purchasing.approval_required": (bool, None, None),
+    "reorder.safety_days": (int, 0, 365),
+    "comms.whatsapp_receipts": (bool, None, None),
+    "comms.whatsapp_thank_you": (bool, None, None),
+    "comms.sms_receipts": (bool, None, None),
+    "comms.email_receipts": (bool, None, None),
+    "comms.thank_you_text": (str, 0, 300),
+    "security.require_mfa_for_admins": (bool, None, None),
 }
 
 
@@ -38,6 +57,25 @@ DEFAULTS = {
     "pharmacy.phone": ("", "Phone number printed on receipts"),
     "transfers.separate_approver": (False, "Transfers and requisitions must be approved by someone other "
                                            "than the requester"),
+    "company.email": ("", "Company e-mail shown on receipts and reports"),
+    "company.website": ("", "Company website"),
+    "company.registration_number": ("", "Pharmacy / business registration number"),
+    "company.tax_id": ("", "Tax identification number (TIN)"),
+    "receipt.footer": ("Thank you for your patronage.", "Text printed at the bottom of receipts"),
+    "receipt.tax_rate_percent": (0, "Tax added to sales, percent (0 = no tax line)"),
+    "receipt.tax_label": ("Tax", "Name of the tax on receipts (e.g. VAT, NHIL)"),
+    "receipt.show_batches": (True, "Print batch numbers and expiry on receipts"),
+    "report.footer": ("", "Text printed at the bottom of PDF reports"),
+    "adjustments.approval_quantity_threshold": (0, "Adjustments of more units than this need approval (0 = never)"),
+    "adjustments.approval_value_threshold": (0, "Adjustments worth more than this need approval (0 = never)"),
+    "purchasing.approval_required": (False, "Purchase orders must be submitted and approved before ordering"),
+    "reorder.safety_days": (7, "Safety stock, in days of average consumption"),
+    "comms.whatsapp_receipts": (False, "Send the digital receipt on WhatsApp after a sale (customer consent required)"),
+    "comms.whatsapp_thank_you": (False, "Send a thank-you message on WhatsApp after a sale"),
+    "comms.sms_receipts": (False, "Send the receipt link by SMS after a sale (customer consent required)"),
+    "comms.email_receipts": (False, "E-mail the receipt after a sale (customer consent required)"),
+    "comms.thank_you_text": ("Thank you for shopping with us.", "Thank-you text used in receipt messages"),
+    "security.require_mfa_for_admins": (False, "Owners and administrators must use two-factor sign-in"),
 }
 
 
@@ -97,6 +135,11 @@ def validate(changes: dict, current: dict) -> dict:
         if kind is bool:
             if not isinstance(value, bool):
                 raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+        elif kind is float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(status_code=400, detail=f"{key} must be a number")
+            if not low <= value <= high:
+                raise HTTPException(status_code=400, detail=f"{key} must be between {low} and {high}")
         elif kind is int:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise HTTPException(status_code=400, detail=f"{key} must be a whole number")

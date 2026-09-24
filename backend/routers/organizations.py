@@ -14,7 +14,7 @@ from .. import audit
 from ..database import get_db
 from ..schemas import Name150
 from ..security import CurrentUser, get_current_user, hash_password, require, require_platform_admin, \
-    validate_password_strength
+    require_step_up, validate_password_strength
 from ..services import organizations, plans
 
 router = APIRouter(tags=["Organization"])
@@ -93,7 +93,7 @@ def platform_list(user: CurrentUser = Depends(require_platform_admin), conn: psy
 
 
 @router.post("/platform/organizations", tags=["Platform"], status_code=201)
-def platform_create(body: OrganizationCreate, user: CurrentUser = Depends(require_platform_admin),
+def platform_create(body: OrganizationCreate, user: CurrentUser = Depends(require_step_up),
                     conn: psycopg.Connection = Depends(get_db)):
     validate_password_strength(body.admin_password, body.admin_username)
     result = organizations.create(
@@ -102,16 +102,17 @@ def platform_create(body: OrganizationCreate, user: CurrentUser = Depends(requir
         admin_password_hash=hash_password(body.admin_password),
         return_to_organization=user.organization_id,
     )
-    audit.record(conn, user, "CREATE", "organization", result["organization"]["id"], None,
-                 {"name": body.name, "plan": body.plan, "org_type": body.org_type,
-                  "administrator": body.admin_username})
+    audit.platform(conn, user, "ORGANIZATION_CREATED", result["organization"]["id"], "organization",
+                   result["organization"]["id"],
+                   {"name": body.name, "plan": body.plan, "org_type": body.org_type, "status": body.status,
+                    "owner": body.admin_username})
     conn.commit()
     return result
 
 
 @router.put("/platform/organizations/{organization_id}", tags=["Platform"])
 def platform_update(organization_id: int, body: PlatformUpdate,
-                    user: CurrentUser = Depends(require_platform_admin),
+                    user: CurrentUser = Depends(require_step_up),
                     conn: psycopg.Connection = Depends(get_db)):
     old = plans.organization(conn, organization_id)
     if organization_id == user.organization_id and body.status in ("SUSPENDED", "CANCELLED"):
@@ -136,8 +137,8 @@ def platform_update(organization_id: int, body: PlatformUpdate,
             """,
             (organization_id,),
         )
-    audit.record(conn, user, "UPDATE", "organization", organization_id,
-                 {"plan": old["plan"], "status": old["status"], "limits": old["limits"]},
-                 {"plan": body.plan, "status": body.status, "limits": body.limits})
+    audit.platform(conn, user, "ORGANIZATION_UPDATED", organization_id, "organization", organization_id,
+                   {"before": {"plan": old["plan"], "status": old["status"], "limits": old["limits"]},
+                    "after": {"plan": body.plan, "status": body.status, "limits": body.limits}})
     conn.commit()
     return {**row, **plans.effective(row)}

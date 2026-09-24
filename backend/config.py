@@ -68,6 +68,26 @@ class Settings:
     rate_limit_api_per_minute: int = 600
     # Extra origins allowed to make state-changing requests (same origin is always allowed).
     allowed_origins: tuple[str, ...] = ()
+    # Encryption of stored secrets (MFA secrets, organization provider credentials).
+    secret_key: str | None = None
+    # Migrations may run as a more privileged (owner) role than the application.
+    migration_database_url: str | None = None
+    # Application role granted row-level privileges after migrations (e.g. pharmastock_app).
+    app_db_role: str | None = None
+    # Platform administrators: shorter sessions, MFA, step-up for high-risk actions.
+    platform_session_hours: int = 4
+    step_up_minutes: int = 10
+    # WhatsApp Business Platform (Cloud API) for the platform-provided sender.
+    whatsapp_phone_number_id: str | None = None
+    whatsapp_access_token: str | None = None
+    whatsapp_app_secret: str | None = None
+    whatsapp_verify_token: str | None = None
+    whatsapp_api_version: str = "v21.0"
+    whatsapp_receipt_template: str = "pharmastock_receipt"
+    whatsapp_template_language: str = "en"
+    # Payments (subscriptions and messaging credits). "manual" = confirmed by MedCart Tech.
+    payment_provider: str = "manual"
+    paystack_secret_key: str | None = None
 
     @property
     def is_production(self) -> bool:
@@ -117,6 +137,20 @@ def load_settings() -> Settings:
         rate_limit_auth_per_minute=_int("RATE_LIMIT_AUTH_PER_MINUTE", 10),
         rate_limit_api_per_minute=_int("RATE_LIMIT_API_PER_MINUTE", 600),
         allowed_origins=tuple(o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()),
+        secret_key=os.getenv("SECRET_KEY") or None,
+        migration_database_url=os.getenv("MIGRATION_DATABASE_URL") or None,
+        app_db_role=os.getenv("APP_DB_ROLE") or None,
+        platform_session_hours=_int("PLATFORM_SESSION_HOURS", 4),
+        step_up_minutes=_int("STEP_UP_MINUTES", 10),
+        whatsapp_phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID") or None,
+        whatsapp_access_token=os.getenv("WHATSAPP_ACCESS_TOKEN") or None,
+        whatsapp_app_secret=os.getenv("WHATSAPP_APP_SECRET") or None,
+        whatsapp_verify_token=os.getenv("WHATSAPP_VERIFY_TOKEN") or None,
+        whatsapp_api_version=os.getenv("WHATSAPP_API_VERSION", "v21.0"),
+        whatsapp_receipt_template=os.getenv("WHATSAPP_RECEIPT_TEMPLATE", "pharmastock_receipt"),
+        whatsapp_template_language=os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "en"),
+        payment_provider=os.getenv("PAYMENT_PROVIDER", "manual").lower(),
+        paystack_secret_key=os.getenv("PAYSTACK_SECRET_KEY") or None,
     )
 
 

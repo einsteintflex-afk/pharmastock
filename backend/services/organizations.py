@@ -58,7 +58,7 @@ def create(conn: psycopg.Connection, *, name: str, org_type: str, plan: str, sta
     admin = conn.execute(
         """
         INSERT INTO users (username, full_name, role, password_hash, must_change_password, organization_id)
-        VALUES (%s, %s, 'ADMINISTRATOR', %s, true, %s)
+        VALUES (%s, %s, 'OWNER', %s, true, %s)
         RETURNING id, username
         """,
         (admin_username, admin_full_name, admin_password_hash, org["id"]),
