@@ -161,3 +161,54 @@ def platform_update(organization_id: int, body: PlatformUpdate,
                     "after": {"plan": body.plan, "status": body.status, "limits": body.limits}})
     conn.commit()
     return {**row, **plans.effective(conn, row)}
+
+
+# ------------------------------------------------------------
+# Onboarding (first-run set-up of a new organization)
+# ------------------------------------------------------------
+
+@router.get("/onboarding")
+def onboarding_status(user: CurrentUser = Depends(get_current_user), conn: psycopg.Connection = Depends(get_db)):
+    """Nine set-up steps, each checked against real data (nothing is ticked
+    by clicking alone, except the optional review steps)."""
+    from ..services import app_settings
+    org = plans.organization(conn, user.organization_id)
+    values = app_settings.get_all(conn)
+    count = lambda sql, *p: conn.execute(sql, p).fetchone()["n"]  # noqa: E731
+    steps = [
+        ("company", "Company profile", "Name, address and phone for receipts and reports", "#/settings",
+         bool(values.get("pharmacy.address")) and bool(values.get("pharmacy.phone")), False),
+        ("logo", "Company logo", "Shown on receipts and PDF reports", "#/settings",
+         count("SELECT COUNT(*) AS n FROM organization_files WHERE kind = 'LOGO'") > 0, True),
+        ("locations", "Locations", "Pharmacy, store, wards or branches", "#/locations",
+         count("SELECT COUNT(*) AS n FROM locations WHERE is_active") > 0, False),
+        ("users", "Team", "Add your staff with the right roles", "#/users",
+         count("SELECT COUNT(*) AS n FROM users WHERE organization_id = %s AND is_active", user.organization_id) > 1,
+         True),
+        ("suppliers", "Suppliers", "Who you buy from", "#/suppliers",
+         count("SELECT COUNT(*) AS n FROM suppliers") > 0, False),
+        ("medicines", "Medicines", "Scan or add the products you stock", "#/medicines",
+         count("SELECT COUNT(*) AS n FROM medicines") > 0, False),
+        ("opening_stock", "Opening stock", "Record the batches on your shelves (or run a stock count)", "#/batches",
+         count("SELECT COUNT(*) AS n FROM batches") > 0, False),
+        ("receipts", "Receipts and tax", "Footer text, tax rate and label", "#/settings",
+         bool(values.get("receipt.footer")), True),
+        ("security", "Two-step verification", "Protect the owner and administrator accounts", "#/account",
+         count("SELECT COUNT(*) AS n FROM users WHERE organization_id = %s AND is_active AND mfa_enabled "
+               "AND role IN ('OWNER', 'ADMINISTRATOR')", user.organization_id) > 0, True),
+    ]
+    items = [{"key": k, "title": t, "description": d, "link": link, "done": done, "optional": optional}
+             for k, t, d, link, done, optional in steps]
+    required_done = all(i["done"] for i in items if not i["optional"])
+    return {"completed_at": org["onboarding_completed_at"], "steps": items,
+            "done": sum(i["done"] for i in items), "total": len(items), "required_done": required_done}
+
+
+@router.post("/onboarding/complete")
+def onboarding_complete(user: CurrentUser = Depends(require("settings.manage")),
+                        conn: psycopg.Connection = Depends(get_db)):
+    conn.execute("UPDATE organizations SET onboarding_completed_at = CURRENT_TIMESTAMP "
+                 "WHERE id = %s AND onboarding_completed_at IS NULL", (user.organization_id,))
+    audit.record(conn, user, "ONBOARDING_COMPLETED", "organization", user.organization_id)
+    conn.commit()
+    return onboarding_status(user, conn)

@@ -10,9 +10,10 @@ from datetime import date, timedelta
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from .. import idempotency
 from ..database import get_db
 from ..pagination import set_total
 from ..schemas import LongText
@@ -31,17 +32,24 @@ class StockMovementCreate(BaseModel):
     quantity: int = Field(ge=0, le=100_000_000)
     reason: LongText | None = None
     fefo_override_reason: LongText | None = None
+    # For RETURNED / DAMAGED / EXPIRED / ADJUSTMENT (default by type).
+    reason_code: str | None = Field(default=None, max_length=30)
 
 
 @router.post("/stock-movements")
-def create_stock_movement(movement: StockMovementCreate,
+def create_stock_movement(movement: StockMovementCreate, request: Request,
                           user: CurrentUser = Depends(require("inventory.read")),
                           conn: psycopg.Connection = Depends(get_db)):
     # The type-specific permission is checked inside stock.record_movement.
+    replay = idempotency.begin(conn, user, request, movement)
+    if replay:
+        return replay
     result = stock.record_movement(
         conn, user, movement.batch_id, movement.movement_type, movement.quantity,
-        movement.reason, movement.fefo_override_reason,
+        movement.reason, movement.fefo_override_reason, reason_code=movement.reason_code,
+        client_name=(request.headers.get("x-client-name") or "")[:100] or None,
     )
+    idempotency.finish(conn, request, result)
     conn.commit()
     return result
 

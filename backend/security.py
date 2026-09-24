@@ -327,3 +327,21 @@ def require_step_up(user: CurrentUser = Depends(require_platform_admin)) -> Curr
         raise HTTPException(status_code=403, detail="step_up_required: confirm with your authenticator code "
                                                     "to continue.")
     return user
+
+
+UNSCOPED_ROLES = ("OWNER", "ADMINISTRATOR", "MANAGER", "AUDITOR")
+
+
+def scoped_location(user: CurrentUser) -> int | None:
+    """The location a user is restricted to for stock work (None = all).
+    Staff assigned to a location work there; owners, administrators,
+    managers and auditors work across locations."""
+    if user.location_id is None or user.role in UNSCOPED_ROLES:
+        return None
+    return user.location_id
+
+
+def check_location_scope(user: CurrentUser, location_id: int | None) -> None:
+    scope = scoped_location(user)
+    if scope is not None and location_id != scope:
+        raise HTTPException(status_code=403, detail="You can only work with stock at your assigned location")

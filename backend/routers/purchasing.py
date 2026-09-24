@@ -11,7 +11,7 @@
 # Added: order detail, notes edit, item edit/remove, cancellation, receiving
 # into a chosen location, batch cost/supplier capture, notifications.
 
-from datetime import date
+from datetime import date, datetime
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -20,23 +20,34 @@ from pydantic import BaseModel, Field
 from .. import audit, idempotency
 from ..database import get_db
 from ..schemas import Code50, Code100, LongText, Name150, blank_to_none
-from ..security import CurrentUser, require
-from ..services import notifications, stock
+from ..security import CurrentUser, check_location_scope, require, scoped_location
+from ..services import app_settings, notifications, plans, stock
 from .inventory import check_location, default_location_id
 
 router = APIRouter(tags=["Purchasing"])
 
-OPEN_STATUSES = ("DRAFT", "ORDERED", "PARTIALLY_RECEIVED")
+OPEN_STATUSES = ("DRAFT", "SUBMITTED", "APPROVED", "ORDERED", "PARTIALLY_RECEIVED")
+# Deliveries can be received against these.
+RECEIVABLE_STATUSES = ("DRAFT", "APPROVED", "ORDERED", "PARTIALLY_RECEIVED")
+AWAITING_DELIVERY = ("APPROVED", "ORDERED", "PARTIALLY_RECEIVED")
+
+
+def approval_required(conn, user: CurrentUser) -> bool:
+    """Approval workflow: DRAFT -> SUBMITTED -> APPROVED -> ORDERED -> received.
+    Without it the original behaviour stays (the first item orders the PO)."""
+    return "purchase_approvals" in user.features and bool(app_settings.get(conn, "purchasing.approval_required"))
 
 
 class PurchaseOrderCreate(BaseModel):
     supplier_id: int
     order_number: Code50
     notes: LongText | None = None
+    expected_delivery_date: date | None = None
 
 
 class PurchaseOrderUpdate(BaseModel):
     notes: LongText | None = None
+    expected_delivery_date: date | None = None
 
 
 class PurchaseOrderItemCreate(BaseModel):
@@ -134,11 +145,11 @@ def create_purchase_order(order: PurchaseOrderCreate,
 
     row = conn.execute(
         """
-        INSERT INTO purchase_orders (supplier_id, order_number, notes, created_by)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id, supplier_id, order_number, order_date, status, notes, created_at
+        INSERT INTO purchase_orders (supplier_id, order_number, notes, created_by, expected_delivery_date)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id, supplier_id, order_number, order_date, status, notes, created_at, expected_delivery_date
         """,
-        (order.supplier_id, order.order_number, blank_to_none(order.notes), user.id),
+        (order.supplier_id, order.order_number, blank_to_none(order.notes), user.id, order.expected_delivery_date),
     ).fetchone()
 
     audit.record(conn, user, "CREATE", "purchase_order", row["id"], None, dict(row))
@@ -154,13 +165,15 @@ def create_purchase_order(order: PurchaseOrderCreate,
 
 @router.get("/purchase-orders")
 def get_purchase_orders(status: str | None = Query(default=None, max_length=30),
-                        supplier_id: int | None = None,
+                        supplier_id: int | None = None, overdue: bool | None = None,
                         user: CurrentUser = Depends(require("inventory.read")),
                         conn: psycopg.Connection = Depends(get_db)):
     rows = conn.execute(
         """
         SELECT po.id, po.supplier_id, suppliers.name AS supplier, po.order_number, po.order_date,
-               po.status, po.notes, po.created_at,
+               po.status, po.notes, po.created_at, po.expected_delivery_date,
+               (po.expected_delivery_date < CURRENT_DATE AND po.status IN ('APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED'))
+                   AS overdue,
                COUNT(poi.id) AS items,
                COALESCE(SUM(poi.quantity_ordered * poi.unit_cost), 0) AS order_value,
                COALESCE(SUM(poi.quantity_ordered), 0)::int AS units_ordered,
@@ -172,10 +185,13 @@ def get_purchase_orders(status: str | None = Query(default=None, max_length=30),
         LEFT JOIN users ON users.id = po.created_by
         WHERE (%(status)s::text IS NULL OR po.status = %(status)s::text)
           AND (%(supplier_id)s::int IS NULL OR po.supplier_id = %(supplier_id)s::int)
+          AND (%(overdue)s::boolean IS NULL OR %(overdue)s::boolean = COALESCE(
+                po.expected_delivery_date < CURRENT_DATE AND po.status IN ('APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED'),
+                false))
         GROUP BY po.id, suppliers.name, users.full_name
         ORDER BY po.id DESC
         """,
-        {"status": status, "supplier_id": supplier_id},
+        {"status": status, "supplier_id": supplier_id, "overdue": overdue},
     ).fetchall()
     return [{**r, "order_date": str(r["order_date"]), "created_at": str(r["created_at"])} for r in rows]
 
@@ -186,10 +202,14 @@ def purchase_order_detail(purchase_order_id: int, user: CurrentUser = Depends(re
     order = conn.execute(
         """
         SELECT po.*, suppliers.name AS supplier, suppliers.is_active AS supplier_active,
-               users.full_name AS created_by_name
+               users.full_name AS created_by_name, su.full_name AS submitted_by_name, au.full_name AS approved_by_name,
+               (po.expected_delivery_date < CURRENT_DATE AND po.status IN ('APPROVED', 'ORDERED', 'PARTIALLY_RECEIVED'))
+                   AS overdue
         FROM purchase_orders po
         JOIN suppliers ON suppliers.id = po.supplier_id
         LEFT JOIN users ON users.id = po.created_by
+        LEFT JOIN users su ON su.id = po.submitted_by
+        LEFT JOIN users au ON au.id = po.approved_by
         WHERE po.id = %s
         """,
         (purchase_order_id,),
@@ -216,6 +236,7 @@ def purchase_order_detail(purchase_order_id: int, user: CurrentUser = Depends(re
 
     return {
         "order": order,
+        "approval_required": approval_required(conn, user),
         "items": items,
         "receipts": receipts,
         "totals": {
@@ -233,12 +254,16 @@ def update_purchase_order(purchase_order_id: int, body: PurchaseOrderUpdate,
                           conn: psycopg.Connection = Depends(get_db)):
     order = _lock_order(conn, purchase_order_id)
     notes = blank_to_none(body.notes)
-    conn.execute("UPDATE purchase_orders SET notes = %s WHERE id = %s", (notes, purchase_order_id))
-    if notes != order["notes"]:
-        audit.record(conn, user, "UPDATE", "purchase_order", purchase_order_id,
-                     {"notes": order["notes"]}, {"notes": notes})
+    expected = body.expected_delivery_date if "expected_delivery_date" in body.model_fields_set \
+        else order["expected_delivery_date"]
+    conn.execute("UPDATE purchase_orders SET notes = %s, expected_delivery_date = %s WHERE id = %s",
+                 (notes, expected, purchase_order_id))
+    before, after = audit.changed_fields({"notes": order["notes"], "expected_delivery_date": order["expected_delivery_date"]},
+                                         {"notes": notes, "expected_delivery_date": expected})
+    if after:
+        audit.record(conn, user, "UPDATE", "purchase_order", purchase_order_id, before, after)
     conn.commit()
-    return {"id": purchase_order_id, "notes": notes}
+    return {"id": purchase_order_id, "notes": notes, "expected_delivery_date": expected}
 
 
 @router.post("/purchase-orders/{purchase_order_id}/cancel")
@@ -265,6 +290,186 @@ def cancel_purchase_order(purchase_order_id: int, body: CancelRequest,
 
 
 # ------------------------------------------------------------
+# Approval workflow
+# ------------------------------------------------------------
+
+class ApprovalNote(BaseModel):
+    note: LongText | None = None
+
+
+def _transition(conn, user: CurrentUser, order_id: int, expected: tuple, new_status: str, action: str,
+                extra_sql: str = "", params: tuple = (), note: str | None = None) -> dict:
+    order = _lock_order(conn, order_id)
+    if order["status"] not in expected:
+        raise HTTPException(status_code=409, detail=f"The order is {order['status'].replace('_', ' ').lower()}")
+    conn.execute(f"UPDATE purchase_orders SET status = %s {extra_sql} WHERE id = %s", (new_status, *params, order_id))
+    audit.record(conn, user, action, "purchase_order", order_id, {"status": order["status"]},
+                 {"status": new_status, **({"note": note} if note else {})})
+    return order
+
+
+@router.post("/purchase-orders/{purchase_order_id}/submit")
+def submit_purchase_order(purchase_order_id: int, user: CurrentUser = Depends(require("purchasing.write")),
+                          conn: psycopg.Connection = Depends(get_db)):
+    if not approval_required(conn, user):
+        raise HTTPException(status_code=400, detail="Purchase order approval is not turned on (Settings)")
+    if not conn.execute("SELECT 1 FROM purchase_order_items WHERE purchase_order_id = %s", (purchase_order_id,)).fetchone():
+        raise HTTPException(status_code=400, detail="Add at least one item before submitting")
+    order = _transition(conn, user, purchase_order_id, ("DRAFT",), "SUBMITTED", "SUBMIT",
+                        ", submitted_by = %s, submitted_at = CURRENT_TIMESTAMP", (user.id,))
+    notifications.event(
+        conn, category="PURCHASING", severity="WARNING",
+        title=f"Purchase order {order['order_number']} awaiting approval",
+        message=f"{user.full_name} submitted {order['order_number']} ({order['supplier']}) for approval.",
+        entity_type="purchase_order", entity_id=purchase_order_id, key=f"po:submitted:{purchase_order_id}:{datetime.now():%Y%m%d%H%M%S%f}",
+    )
+    conn.commit()
+    return purchase_order_detail(purchase_order_id, user, conn)
+
+
+@router.post("/purchase-orders/{purchase_order_id}/approve")
+def approve_purchase_order(purchase_order_id: int, body: ApprovalNote,
+                           user: CurrentUser = Depends(require("purchasing.approve")),
+                           conn: psycopg.Connection = Depends(get_db)):
+    order = _lock_order(conn, purchase_order_id)
+    if order["submitted_by"] == user.id:
+        raise HTTPException(status_code=403, detail="A purchase order must be approved by someone other than "
+                                                    "the person who submitted it")
+    _transition(conn, user, purchase_order_id, ("SUBMITTED",), "APPROVED", "APPROVE",
+                ", approved_by = %s, approved_at = CURRENT_TIMESTAMP", (user.id,), note=body.note)
+    conn.commit()
+    return purchase_order_detail(purchase_order_id, user, conn)
+
+
+@router.post("/purchase-orders/{purchase_order_id}/reject")
+def reject_purchase_order(purchase_order_id: int, body: CancelRequest,
+                          user: CurrentUser = Depends(require("purchasing.approve")),
+                          conn: psycopg.Connection = Depends(get_db)):
+    """Back to DRAFT for changes, with the reason."""
+    _transition(conn, user, purchase_order_id, ("SUBMITTED", "APPROVED"), "DRAFT", "REJECT",
+                ", submitted_by = NULL, submitted_at = NULL, approved_by = NULL, approved_at = NULL", note=body.reason)
+    conn.commit()
+    return purchase_order_detail(purchase_order_id, user, conn)
+
+
+@router.post("/purchase-orders/{purchase_order_id}/mark-ordered")
+def mark_purchase_order_ordered(purchase_order_id: int, user: CurrentUser = Depends(require("purchasing.write")),
+                                conn: psycopg.Connection = Depends(get_db)):
+    """The approved order was sent to the supplier."""
+    _transition(conn, user, purchase_order_id, ("APPROVED",), "ORDERED", "MARK_ORDERED",
+                ", ordered_at = CURRENT_TIMESTAMP")
+    conn.commit()
+    return purchase_order_detail(purchase_order_id, user, conn)
+
+
+# ------------------------------------------------------------
+# Purchase order from reorder recommendations; price history
+# ------------------------------------------------------------
+
+class ReorderLine(BaseModel):
+    medicine_id: int
+    quantity: int = Field(gt=0, le=100_000_000)
+    unit_cost: float | None = Field(default=None, ge=0, le=10_000_000)
+
+
+class FromReorder(BaseModel):
+    supplier_id: int
+    items: list[ReorderLine] = Field(min_length=1, max_length=200)
+    expected_delivery_date: date | None = None
+    notes: LongText | None = None
+
+
+def last_price(conn, medicine_id: int, supplier_id: int | None = None):
+    """Most recent unit cost paid for a medicine (from this supplier when given)."""
+    row = conn.execute(
+        """
+        SELECT poi.unit_cost FROM purchase_order_items poi JOIN purchase_orders po ON po.id = poi.purchase_order_id
+        WHERE poi.medicine_id = %s AND po.status <> 'CANCELLED'
+          AND (%s::int IS NULL OR po.supplier_id = %s::int)
+        ORDER BY po.order_date DESC, poi.id DESC LIMIT 1
+        """,
+        (medicine_id, supplier_id, supplier_id),
+    ).fetchone()
+    return float(row["unit_cost"]) if row else None
+
+
+@router.post("/purchase-orders/from-reorder", status_code=201)
+def purchase_order_from_reorder(body: FromReorder, user: CurrentUser = Depends(require("purchasing.write")),
+                                conn: psycopg.Connection = Depends(get_db)):
+    """Create a draft order from chosen reorder recommendations. A missing
+    unit cost is taken from the last price paid to this supplier, then to
+    any supplier; if there is none the line must carry a cost (no guessing)."""
+    supplier = conn.execute("SELECT id, name, is_active FROM suppliers WHERE id = %s", (body.supplier_id,)).fetchone()
+    if supplier is None or not supplier["is_active"]:
+        raise HTTPException(status_code=400, detail="Choose an active supplier")
+    lines, missing = [], []
+    for line in body.items:
+        medicine = conn.execute("SELECT id, name, is_active FROM medicines WHERE id = %s", (line.medicine_id,)).fetchone()
+        if medicine is None or not medicine["is_active"]:
+            raise HTTPException(status_code=400, detail=f"Medicine {line.medicine_id} is not active")
+        cost = line.unit_cost
+        if cost is None:
+            cost = last_price(conn, line.medicine_id, body.supplier_id)
+        if cost is None:
+            cost = last_price(conn, line.medicine_id)
+        if cost is None:
+            missing.append(medicine["name"])
+        lines.append((line, cost))
+    if missing:
+        raise HTTPException(status_code=400, detail={"message": "Enter a unit cost for items never bought before",
+                                                     "medicines": missing})
+    if len({line.medicine_id for line, _ in lines}) != len(lines):
+        raise HTTPException(status_code=400, detail="Each medicine can appear once")
+    number = next_order_number(user, conn)["order_number"]
+    order = conn.execute(
+        """
+        INSERT INTO purchase_orders (supplier_id, order_number, notes, created_by, expected_delivery_date)
+        VALUES (%s, %s, %s, %s, %s) RETURNING id
+        """,
+        (body.supplier_id, number, blank_to_none(body.notes) or "Created from reorder recommendations", user.id,
+         body.expected_delivery_date),
+    ).fetchone()
+    for line, cost in lines:
+        conn.execute(
+            "INSERT INTO purchase_order_items (purchase_order_id, medicine_id, quantity_ordered, unit_cost) "
+            "VALUES (%s, %s, %s, %s)", (order["id"], line.medicine_id, line.quantity, cost))
+    audit.record(conn, user, "CREATE_FROM_REORDER", "purchase_order", order["id"], None,
+                 {"order_number": number, "supplier_id": body.supplier_id, "lines": len(lines)})
+    conn.commit()
+    return purchase_order_detail(order["id"], user, conn)
+
+
+@router.get("/price-history")
+def price_history(medicine_id: int | None = None, supplier_id: int | None = None,
+                  limit: int = Query(100, ge=1, le=1000),
+                  user: CurrentUser = Depends(require("inventory.read")), conn: psycopg.Connection = Depends(get_db)):
+    """Unit costs paid over time, per medicine and supplier (from purchase orders)."""
+    if medicine_id is None and supplier_id is None:
+        raise HTTPException(status_code=400, detail="Give a medicine_id or a supplier_id")
+    rows = conn.execute(
+        """
+        SELECT po.order_date, po.order_number, po.id AS purchase_order_id, po.status, s.id AS supplier_id,
+               s.name AS supplier, m.id AS medicine_id, m.name AS medicine, m.strength, poi.quantity_ordered,
+               poi.unit_cost,
+               poi.unit_cost - LAG(poi.unit_cost) OVER (PARTITION BY poi.medicine_id, po.supplier_id
+                                                       ORDER BY po.order_date, poi.id) AS change_from_previous
+        FROM purchase_order_items poi
+        JOIN purchase_orders po ON po.id = poi.purchase_order_id
+        JOIN suppliers s ON s.id = po.supplier_id
+        JOIN medicines m ON m.id = poi.medicine_id
+        WHERE po.status <> 'CANCELLED'
+          AND (%(medicine)s::int IS NULL OR poi.medicine_id = %(medicine)s::int)
+          AND (%(supplier)s::int IS NULL OR po.supplier_id = %(supplier)s::int)
+        ORDER BY po.order_date DESC, poi.id DESC LIMIT %(limit)s
+        """,
+        {"medicine": medicine_id, "supplier": supplier_id, "limit": limit},
+    ).fetchall()
+    return [{**r, "unit_cost": float(r["unit_cost"]),
+             "change_from_previous": None if r["change_from_previous"] is None else float(r["change_from_previous"])}
+            for r in rows]
+
+
+# ------------------------------------------------------------
 # Purchase order items
 # ------------------------------------------------------------
 
@@ -275,6 +480,9 @@ def add_purchase_order_item(purchase_order_id: int, item: PurchaseOrderItemCreat
     order = _lock_order(conn, purchase_order_id)
     if order["status"] in ("RECEIVED", "CANCELLED"):
         raise HTTPException(status_code=400, detail="Items cannot be added to a received or cancelled order")
+    workflow = approval_required(conn, user)
+    if workflow and order["status"] != "DRAFT":
+        raise HTTPException(status_code=400, detail="Only a draft order can be changed; it has been submitted for approval")
 
     medicine = conn.execute(
         "SELECT id, name, strength, dosage_form, is_active FROM medicines WHERE id = %s", (item.medicine_id,)
@@ -299,8 +507,9 @@ def add_purchase_order_item(purchase_order_id: int, item: PurchaseOrderItemCreat
         (purchase_order_id, item.medicine_id, item.quantity_ordered, item.unit_cost),
     ).fetchone()
 
-    # Original behaviour: the first item moves a DRAFT order to ORDERED.
-    if order["status"] == "DRAFT":
+    # Original behaviour: the first item moves a DRAFT order to ORDERED
+    # (unless the approval workflow is on).
+    if order["status"] == "DRAFT" and not workflow:
         conn.execute("UPDATE purchase_orders SET status = 'ORDERED' WHERE id = %s", (purchase_order_id,))
 
     audit.record(conn, user, "ADD_ITEM", "purchase_order", purchase_order_id, None, dict(row))
@@ -344,6 +553,9 @@ def _lock_item(conn, purchase_order_id: int, item_id: int) -> tuple[dict, dict]:
         raise HTTPException(status_code=404, detail="Purchase order item not found")
     if order["status"] in ("RECEIVED", "CANCELLED"):
         raise HTTPException(status_code=400, detail=f"Items of a {order['status']} order cannot be changed")
+    if order["status"] in ("SUBMITTED", "APPROVED"):
+        raise HTTPException(status_code=400, detail="An order awaiting or holding approval cannot be changed; "
+                                                    "reject it back to draft first")
     return order, item
 
 
@@ -426,6 +638,8 @@ def receive_purchase_order_item(receipt: PurchaseReceiptCreate, request: Request
 
     if item["status"] == "CANCELLED":
         raise HTTPException(status_code=400, detail="Cannot receive stock for a cancelled purchase order")
+    if item["status"] == "SUBMITTED" or (item["status"] == "DRAFT" and approval_required(conn, user)):
+        raise HTTPException(status_code=400, detail="This order has not been approved yet")
 
     remaining = item["quantity_ordered"] - item["quantity_received"]
     if receipt.quantity_received > remaining:
@@ -442,8 +656,9 @@ def receive_purchase_order_item(receipt: PurchaseReceiptCreate, request: Request
     if receipt.expiry_date < date.today():
         raise HTTPException(status_code=400, detail="Cannot receive stock that has already expired")
 
-    location_id = receipt.location_id or default_location_id(conn)
+    location_id = receipt.location_id or scoped_location(user) or default_location_id(conn)
     check_location(conn, location_id)
+    check_location_scope(user, location_id)
     unit_cost = item["unit_cost"]
 
     existing = conn.execute(

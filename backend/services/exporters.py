@@ -122,27 +122,45 @@ def to_xlsx(report: Report, generated_by: str) -> bytes:
     return buffer.getvalue()
 
 
-def to_pdf(report: Report, generated_by: str) -> bytes:
+def to_pdf(report: Report, generated_by: str, brand: dict | None = None) -> bytes:
+    """brand: the organization's branding (services/branding.profile): name,
+    logo, details and footer in the header / footer of every report."""
     buffer = io.BytesIO()
+    brand = brand or {}
     document = SimpleDocTemplate(
         buffer, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm,
-        topMargin=12 * mm, bottomMargin=12 * mm, title=report.title, author="PharmaStock",
+        topMargin=12 * mm, bottomMargin=16 * mm, title=report.title, author=brand.get("name") or "PharmaStock",
     )
     styles = getSampleStyleSheet()
     small = styles["BodyText"].clone("small", fontSize=7.5, leading=9)
     header_style = styles["BodyText"].clone("header", fontSize=7.5, leading=9, textColor=colors.white,
                                             fontName="Helvetica-Bold")
 
-    story = [
-        Paragraph(f"PharmaStock — {report.title}", styles["Title"]),
+    def para(text, style):
+        safe = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return Paragraph(safe, style)
+
+    company = brand.get("name") or "PharmaStock"
+    heading = [para(company, styles["Heading2"]),
+               para(" · ".join(x for x in (brand.get("address"), brand.get("phone"), brand.get("email")) if x),
+                    small)]
+    if brand.get("logo_png"):
+        from PIL import Image as PILImage
+        from reportlab.platypus import Image
+        with PILImage.open(io.BytesIO(brand["logo_png"])) as probe:
+            ratio = probe.height / probe.width
+        logo = Image(io.BytesIO(brand["logo_png"]), width=28 * mm, height=28 * mm * ratio)
+        head = Table([[logo, heading]], colWidths=[32 * mm, None])
+        head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+        story = [head]
+    else:
+        story = heading
+    story += [
+        Paragraph(report.title, styles["Title"]),
         Paragraph(f"{report.subtitle}<br/>Generated {datetime.now():%Y-%m-%d %H:%M} by {generated_by}",
                   styles["BodyText"]),
         Spacer(1, 5 * mm),
     ]
-
-    def para(text, style):
-        safe = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return Paragraph(safe, style)
 
     data = [[para(label, header_style) for _, label, _ in report.columns]]
     for row in report.rows:
@@ -166,5 +184,15 @@ def to_pdf(report: Report, generated_by: str) -> bytes:
         summary.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B0B7C3"))]))
         story.append(summary)
 
-    document.build(story)
+    footer_text = " — ".join(x for x in (brand.get("report_footer"), brand.get("powered_by")) if x)
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.HexColor("#6B7686"))
+        canvas.drawString(12 * mm, 8 * mm, f"{company} · {report.title}" + (f" · {footer_text}" if footer_text else ""))
+        canvas.drawRightString(doc.pagesize[0] - 12 * mm, 8 * mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=footer, onLaterPages=footer)
     return buffer.getvalue()

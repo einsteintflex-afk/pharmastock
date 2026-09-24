@@ -6,12 +6,12 @@ from datetime import date
 from typing import Literal
 
 import psycopg
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from .. import idempotency
 from ..database import get_db
-from ..schemas import LongText, Name150, Phone, Text255, blank_to_none
+from ..schemas import Email, LongText, Name150, Phone, Text255, blank_to_none
 from ..security import CurrentUser, require
 from ..services import dispensing
 
@@ -25,6 +25,12 @@ class DispensationItem(BaseModel):
     directions: Text255 | None = None
 
 
+class ReceiptConsent(BaseModel):
+    whatsapp: bool = False
+    sms: bool = False
+    email: bool = False
+
+
 class DispensationCreate(BaseModel):
     dispense_type: Literal["PRESCRIPTION", "OTC"]
     payment_method: Literal["CASH", "MOBILE_MONEY", "CARD", "NHIS", "INSURANCE", "CREDIT", "NO_CHARGE"]
@@ -35,6 +41,11 @@ class DispensationCreate(BaseModel):
     prescription_number: Text255 | None = None
     location_id: int | None = None
     notes: LongText | None = None
+    discount_amount: float | None = Field(default=None, ge=0, le=100_000_000)
+    discount_percent: float | None = Field(default=None, gt=0, le=100)
+    customer_email: Email | None = None
+    # The customer agreed, at the counter, to receive the receipt on these channels.
+    consent: ReceiptConsent = Field(default_factory=lambda: ReceiptConsent())
 
 
 class VoidRequest(BaseModel):
@@ -49,7 +60,9 @@ def create_dispensation(body: DispensationCreate, request: Request,
     if replay:
         return replay
     data = body.model_dump()
-    for key in ("patient_name", "patient_phone", "prescriber", "prescription_number", "notes"):
+    if body.discount_amount and body.discount_percent:
+        raise HTTPException(status_code=400, detail="Give the discount as an amount or a percentage, not both")
+    for key in ("patient_name", "patient_phone", "prescriber", "prescription_number", "notes", "customer_email"):
         data[key] = blank_to_none(data[key])
     for item in data["items"]:
         item["directions"] = blank_to_none(item["directions"])

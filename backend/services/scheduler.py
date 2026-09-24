@@ -11,7 +11,7 @@ import psycopg
 from fastapi import HTTPException
 
 from .. import audit
-from . import app_settings, delivery, exporters, reports
+from . import app_settings, branding, delivery, exporters, reports
 
 MEDIA = {
     "csv": "text/csv",
@@ -79,7 +79,7 @@ def run(conn: psycopg.Connection, schedule: dict, user=None) -> dict:
     fmt = schedule["format"]
     author = user.full_name if user else "PharmaStock scheduler"
     content = {"csv": lambda: exporters.to_csv(report), "xlsx": lambda: exporters.to_xlsx(report, author),
-               "pdf": lambda: exporters.to_pdf(report, author)}[fmt]()
+               "pdf": lambda: exporters.to_pdf(report, author, branding.profile(conn))}[fmt]()
     filename = f"pharmastock-{schedule['report_key']}-{date.today():%Y%m%d}.{fmt}"
     body = (f"{report.title}\n{report.subtitle}\n\n"
             + "\n".join(f"{label}: {value}" for label, value in report.summary)

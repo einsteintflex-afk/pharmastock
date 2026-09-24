@@ -12,7 +12,7 @@ from fastapi.responses import Response
 from .. import audit
 from ..database import get_db
 from ..security import CurrentUser, require
-from ..services import app_settings, exporters, reports
+from ..services import app_settings, branding, exporters, reports
 
 router = APIRouter(tags=["Reports"])
 
@@ -74,7 +74,7 @@ def run_report(
     elif format == "xlsx":
         content = exporters.to_xlsx(report, user.full_name)
     else:
-        content = exporters.to_pdf(report, user.full_name)
+        content = exporters.to_pdf(report, user.full_name, branding.profile(conn))
 
     audit.record(conn, user, "EXPORT", "report", report_key, None,
                  {"format": format, "rows": len(report.rows), "filters": filters})

@@ -32,6 +32,10 @@ ALL_MOVEMENT_TYPES = MOVEMENT_TYPES + TRANSFER_TYPES
 # Stored quantity adds to the batch (ADJUSTMENT stores a signed change).
 POSITIVE_TYPES = ("RECEIVED", "RETURNED", "ADJUSTMENT", "TRANSFER_IN")
 
+# Manual changes recorded as stock adjustments, with their default reason code.
+_ADJUSTMENT_REASONS = {"ADJUSTMENT": "PHYSICAL_COUNT", "DAMAGED": "DAMAGE", "EXPIRED": "EXPIRY_WRITE_OFF",
+                       "RETURNED": "CUSTOMER_RETURN"}
+
 # Permission needed to record each movement type.
 MOVEMENT_PERMISSIONS = {
     "RECEIVED": "batches.write",
@@ -243,6 +247,8 @@ def record_movement(
     quantity: int,
     reason: str | None,
     fefo_override_reason: str | None = None,
+    reason_code: str | None = None,
+    client_name: str | None = None,
 ) -> dict:
     """Record one movement against one batch.
 
@@ -276,6 +282,35 @@ def record_movement(
 
     if movement_type in ("ADJUSTMENT", "DAMAGED") and not reason:
         raise HTTPException(status_code=400, detail=f"A reason is required for {movement_type}")
+
+    if movement_type in _ADJUSTMENT_REASONS:
+        # Manual stock changes are adjustments: reason code, previous / new
+        # quantity, device, request id, approval thresholds.
+        from . import adjustments
+        if movement_type == "EXPIRED" and _lock_batch(conn, batch_id)["expiry_date"] >= date.today():
+            raise HTTPException(
+                status_code=400,
+                detail="This batch has not expired. Use DAMAGED or ADJUSTMENT for other write-offs.",
+            )
+        result = adjustments.create(
+            conn, user, batch_id=batch_id, reason_code=reason_code or _ADJUSTMENT_REASONS[movement_type],
+            counted_quantity=quantity if movement_type == "ADJUSTMENT" else None,
+            change=None if movement_type == "ADJUSTMENT" else signed_quantity(movement_type, quantity),
+            notes=reason, client_name=client_name,
+        )
+        movement = conn.execute("SELECT movement_date FROM stock_movements WHERE id = %s",
+                                (result["movement_id"],)).fetchone() if result["movement_id"] else None
+        return {
+            "id": result["movement_id"],
+            "batch_id": batch_id,
+            "movement_type": movement_type,
+            "quantity": result["adjustment_quantity"] if movement_type == "ADJUSTMENT" else quantity,
+            "movement_date": str(movement["movement_date"]) if movement else None,
+            "reason": reason,
+            "new_batch_quantity": result["new_quantity"],
+            "adjustment": {"id": result["id"], "number": result["adjustment_number"], "status": result["status"],
+                           "reason_code": result["reason_code"]},
+        }
 
     batch = _lock_batch(conn, batch_id)
     current = batch["quantity"]

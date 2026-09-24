@@ -13,14 +13,17 @@
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 
+import secrets
+
 import psycopg
 from fastapi import HTTPException
 
 from .. import audit
-from ..security import CurrentUser
-from . import stock
+from ..security import CurrentUser, scoped_location
+from . import app_settings, stock
 
 DISPENSE_TYPES = ("PRESCRIPTION", "OTC")
+RECEIPT_LINK_DAYS = 90
 PAYMENT_METHODS = ("CASH", "MOBILE_MONEY", "CARD", "NHIS", "INSURANCE", "CREDIT", "NO_CHARGE")
 
 
@@ -69,23 +72,39 @@ def create(conn: psycopg.Connection, user: CurrentUser, body: dict) -> dict:
         raise HTTPException(status_code=404, detail=f"Medicine not found: {missing}")
 
     location_id = body.get("location_id")
+    # Staff assigned to one location sell from that location only.
+    scope = scoped_location(user)
+    if scope is not None:
+        if location_id is not None and location_id != scope:
+            raise HTTPException(status_code=403, detail="You can only dispense from your assigned location")
+        location_id = scope
     if location_id is not None:
         row = conn.execute("SELECT is_active FROM locations WHERE id = %s", (location_id,)).fetchone()
         if row is None or not row["is_active"]:
             raise HTTPException(status_code=400, detail="Location not found or inactive")
 
+    consent = body.get("consent") or {}
+    if consent.get("whatsapp") or consent.get("sms"):
+        if not body.get("patient_phone"):
+            raise HTTPException(status_code=400, detail="A phone number is needed to send the receipt by WhatsApp / SMS")
+    if consent.get("email") and not body.get("customer_email"):
+        raise HTTPException(status_code=400, detail="An e-mail address is needed to e-mail the receipt")
+
     number = _next_number(conn)
+    token = secrets.token_hex(16)
     dispensation = conn.execute(
         """
         INSERT INTO dispensations
             (dispensation_number, dispense_type, patient_name, patient_phone, prescriber,
-             prescription_number, location_id, payment_method, notes, user_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             prescription_number, location_id, payment_method, notes, user_id, receipt_token, customer_email,
+             consent_whatsapp, consent_sms, consent_email)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (number, body["dispense_type"], body.get("patient_name"), body.get("patient_phone"),
          body.get("prescriber"), body.get("prescription_number"), location_id,
-         body["payment_method"], body.get("notes"), user.id),
+         body["payment_method"], body.get("notes"), user.id, token, body.get("customer_email"),
+         bool(consent.get("whatsapp")), bool(consent.get("sms")), bool(consent.get("email"))),
     ).fetchone()
     dispensation_id = dispensation["id"]
 
@@ -106,11 +125,46 @@ def create(conn: psycopg.Connection, user: CurrentUser, body: dict) -> dict:
         stock.allocate_fefo(conn, user, medicine["id"], item["quantity"], location_id, reason, line["id"])
         total += line_total or 0
 
-    conn.execute("UPDATE dispensations SET total_amount = %s WHERE id = %s", (total, dispensation_id))
+    subtotal = total
+    discount = _money(body.get("discount_amount") or 0)
+    if body.get("discount_percent"):
+        discount = _money(subtotal * Decimal(str(body["discount_percent"])) / 100)
+    if discount > subtotal:
+        raise HTTPException(status_code=400, detail="The discount is larger than the sale")
+    rate = Decimal(str(app_settings.get(conn, "receipt.tax_rate_percent") or 0))
+    tax = _money((subtotal - discount) * rate / 100) if rate else Decimal("0.00")
+    grand_total = subtotal - discount + tax
+    conn.execute(
+        """
+        UPDATE dispensations SET total_amount = %s, subtotal_amount = %s, discount_amount = %s, tax_amount = %s,
+               tax_label = %s WHERE id = %s
+        """,
+        (grand_total, subtotal, discount, tax, app_settings.get(conn, "receipt.tax_label") if rate else None,
+         dispensation_id),
+    )
+    conn.execute(
+        "INSERT INTO receipt_links (token, organization_id, dispensation_id, expires_at) "
+        "VALUES (%s, current_org(), %s, CURRENT_TIMESTAMP + make_interval(days => %s))",
+        (token, dispensation_id, RECEIPT_LINK_DAYS),
+    )
+    # Consent is asked at the counter and recorded per phone number and channel.
+    for channel in ("whatsapp", "sms"):
+        if consent.get(channel):
+            conn.execute(
+                """
+                INSERT INTO message_consents (phone, channel, status, source, recorded_by)
+                VALUES (%s, %s, 'OPTED_IN', 'COUNTER', %s)
+                ON CONFLICT (organization_id, phone, channel) DO UPDATE
+                    SET status = 'OPTED_IN', source = 'COUNTER', recorded_by = EXCLUDED.recorded_by,
+                        recorded_at = CURRENT_TIMESTAMP
+                """,
+                (body["patient_phone"], channel.upper(), user.id),
+            )
 
     audit.record(conn, user, "DISPENSE", "dispensation", dispensation_id, None, {
         "number": number, "type": body["dispense_type"], "payment_method": body["payment_method"],
-        "total": total, "items": [{"medicine_id": i["medicine_id"], "quantity": i["quantity"]} for i in items],
+        "subtotal": subtotal, "discount": discount, "tax": tax, "total": grand_total,
+        "items": [{"medicine_id": i["medicine_id"], "quantity": i["quantity"]} for i in items],
     })
     return get(conn, dispensation_id)
 
