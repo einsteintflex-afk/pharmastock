@@ -16,7 +16,7 @@ from ..database import get_db
 from ..pagination import Page, page_params, paginate
 from ..schemas import Name150, Short50, blank_to_none
 from ..security import CurrentUser, require
-from ..services import analytics, barcode, inventory, stock
+from ..services import analytics, barcode, inventory, plans, stock
 
 router = APIRouter(tags=["Medicines"])
 
@@ -139,6 +139,8 @@ def create_medicine(body: MedicineCreate, user: CurrentUser = Depends(require("m
                     conn: psycopg.Connection = Depends(get_db)):
     _duplicate_check(conn, body)
     _gtin_check(conn, body.gtin)
+    plans.check_limit(conn, user.organization_id, "max_medicines",
+                      conn.execute("SELECT COUNT(*) AS n FROM medicines").fetchone()["n"])
     row = conn.execute(
         f"""
         INSERT INTO medicines (name, strength, dosage_form, reorder_level, {', '.join(OPTIONAL_FIELDS)})

@@ -181,7 +181,7 @@ def _complete_login(conn, request: Request, user: dict, client_name: str | None,
         organization_id=user["organization_id"], organization_name=user["organization_name"],
         org_type=user["org_type"], plan=user["plan"], is_platform_admin=user["is_platform_admin"],
         location_id=user["location_id"],
-        features=set(plans.effective({"plan": user["plan"], "limits": user["limits"]})["features"]),
+        features=set(plans.effective(conn, {"plan": user["plan"], "limits": user["limits"]})["features"]),
         mfa_enabled=user["mfa_enabled"], mfa_verified_at=datetime.now() if mfa_verified else None,
     )
     current.mfa_setup_required = mfa_required_for(conn, current) and not current.mfa_enabled

@@ -31,7 +31,7 @@ def describe(conn: psycopg.Connection, organization_id: int) -> dict:
         "id": org["id"], "name": org["name"], "org_type": org["org_type"], "status": org["status"],
         "trial_ends_at": org["trial_ends_at"], "current_period_end": org["current_period_end"],
         "created_at": org["created_at"],
-        **plans.effective(org),
+        **plans.effective(conn, org),
         "feature_labels": plans.FEATURE_LABELS,
         "usage": usage(conn, organization_id),
     }

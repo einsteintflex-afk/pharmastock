@@ -220,3 +220,215 @@ def revoke_recovery_access(token_id: int, user: CurrentUser = Depends(require_pl
                    token_id, {"username": row["username"]})
     conn.commit()
     return {"revoked": token_id}
+
+
+# ------------------------------------------------------------
+# Plan catalogue and entitlements
+# ------------------------------------------------------------
+
+class PlanBody(BaseModel):
+    label: str = Field(min_length=1, max_length=60)
+    description: str | None = Field(default=None, max_length=500)
+    limits: dict = Field(default_factory=dict)
+    features: list[str] = Field(default_factory=list)
+    price_monthly: float | None = Field(default=None, ge=0, le=100_000_000)
+    price_annual: float | None = Field(default=None, ge=0, le=100_000_000)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    is_active: bool = True
+    sort_order: int = Field(default=0, ge=0, le=100)
+
+
+def _validate_plan(body: PlanBody) -> None:
+    from ..services import plans
+    unknown = set(body.features) - set(plans.FEATURE_LABELS)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown features: {sorted(unknown)}")
+    bad = set(body.limits) - set(plans.LIMIT_LABELS)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown limits: {sorted(bad)}")
+    for key, value in body.limits.items():
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise HTTPException(status_code=400, detail=f"{key} must be a whole number or null (unlimited)")
+    if (body.price_monthly is not None or body.price_annual is not None) and not body.currency:
+        raise HTTPException(status_code=400, detail="A price needs a currency")
+
+
+@router.get("/plans")
+def platform_plans(user: CurrentUser = Depends(require_platform_admin), conn: psycopg.Connection = Depends(get_db)):
+    from ..services import plans
+    rows = conn.execute(
+        """
+        SELECT p.*, COUNT(o.id) AS organizations
+        FROM plans p LEFT JOIN organizations o ON o.plan = p.code
+        GROUP BY p.code ORDER BY p.sort_order, p.code
+        """
+    ).fetchall()
+    return {"plans": rows, "feature_labels": plans.FEATURE_LABELS, "limit_labels": plans.LIMIT_LABELS}
+
+
+@router.put("/plans/{code}")
+def platform_save_plan(code: str, body: PlanBody, user: CurrentUser = Depends(require_step_up),
+                       conn: psycopg.Connection = Depends(get_db)):
+    import json
+
+    from ..services import plans
+    if not code.isupper() or not code.replace("_", "").isalnum() or len(code) > 30:
+        raise HTTPException(status_code=400, detail="Plan code: capital letters, digits and _ only")
+    _validate_plan(body)
+    old = conn.execute("SELECT * FROM plans WHERE code = %s", (code,)).fetchone()
+    if old and not body.is_active:
+        in_use = conn.execute("SELECT COUNT(*) AS n FROM organizations WHERE plan = %s", (code,)).fetchone()["n"]
+        if in_use:
+            raise HTTPException(status_code=400, detail=f"{in_use} organization(s) are on this plan; move them first")
+    row = conn.execute(
+        """
+        INSERT INTO plans (code, label, description, limits, features, price_monthly, price_annual, currency,
+                           is_active, sort_order, updated_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (code) DO UPDATE SET label = EXCLUDED.label, description = EXCLUDED.description,
+            limits = EXCLUDED.limits, features = EXCLUDED.features, price_monthly = EXCLUDED.price_monthly,
+            price_annual = EXCLUDED.price_annual, currency = EXCLUDED.currency, is_active = EXCLUDED.is_active,
+            sort_order = EXCLUDED.sort_order, updated_by = EXCLUDED.updated_by, updated_at = CURRENT_TIMESTAMP
+        RETURNING *
+        """,
+        (code, body.label, body.description, json.dumps(body.limits), sorted(set(body.features)),
+         body.price_monthly, body.price_annual, body.currency, body.is_active, body.sort_order, user.id),
+    ).fetchone()
+    audit.platform(conn, user, "PLAN_SAVED", None, "plan", code,
+                   {"before": {k: old[k] for k in ("limits", "features", "price_monthly", "price_annual", "is_active")}
+                    if old else None,
+                    "after": {"limits": body.limits, "features": sorted(set(body.features)),
+                              "price_monthly": body.price_monthly, "price_annual": body.price_annual,
+                              "is_active": body.is_active}})
+    conn.commit()
+    plans.invalidate()
+    return row
+
+
+class PackageBody(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    credits: int = Field(gt=0, le=10_000_000)
+    price: float | None = Field(default=None, ge=0, le=100_000_000)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    is_active: bool = False
+
+
+@router.get("/messaging-packages")
+def platform_packages(user: CurrentUser = Depends(require_platform_admin), conn: psycopg.Connection = Depends(get_db)):
+    return conn.execute("SELECT * FROM messaging_packages ORDER BY credits").fetchall()
+
+
+@router.put("/messaging-packages/{code}")
+def platform_save_package(code: str, body: PackageBody, user: CurrentUser = Depends(require_step_up),
+                          conn: psycopg.Connection = Depends(get_db)):
+    if not code.replace("_", "").isalnum() or len(code) > 30:
+        raise HTTPException(status_code=400, detail="Package code: letters, digits and _ only")
+    if body.is_active and (body.price is None or not body.currency):
+        raise HTTPException(status_code=400, detail="An active package needs a price and a currency")
+    row = conn.execute(
+        """
+        INSERT INTO messaging_packages (code, label, credits, price, currency, is_active)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (code) DO UPDATE SET label = EXCLUDED.label, credits = EXCLUDED.credits, price = EXCLUDED.price,
+            currency = EXCLUDED.currency, is_active = EXCLUDED.is_active, updated_at = CURRENT_TIMESTAMP
+        RETURNING *
+        """,
+        (code.upper(), body.label, body.credits, body.price, body.currency, body.is_active),
+    ).fetchone()
+    audit.platform(conn, user, "MESSAGING_PACKAGE_SAVED", None, "messaging_package", code.upper(), body.model_dump())
+    conn.commit()
+    return row
+
+
+# ------------------------------------------------------------
+# Payments and credits
+# ------------------------------------------------------------
+
+@router.get("/payments")
+def platform_payments(status: str | None = None, limit: int = Query(100, ge=1, le=500),
+                      user: CurrentUser = Depends(require_platform_admin), conn: psycopg.Connection = Depends(get_db)):
+    where, params = "true", []
+    if status:
+        where, params = "p.status = %s", [status.upper()]
+    return conn.execute(
+        f"""
+        SELECT p.*, o.name AS organization_name FROM payments p JOIN organizations o ON o.id = p.organization_id
+        WHERE {where} ORDER BY p.id DESC LIMIT %s
+        """,
+        [*params, limit],
+    ).fetchall()
+
+
+class ConfirmPayment(BaseModel):
+    note: str = Field(min_length=3, max_length=300)
+
+
+@router.post("/payments/{payment_id}/confirm")
+def platform_confirm_payment(payment_id: int, body: ConfirmPayment, user: CurrentUser = Depends(require_step_up),
+                             conn: psycopg.Connection = Depends(get_db)):
+    """Manual payments only (bank transfer / mobile money received by MedCart
+    Tech). Online payments are confirmed by the provider's webhook."""
+    from ..services import billing
+    payment = conn.execute("SELECT * FROM payments WHERE id = %s", (payment_id,)).fetchone()
+    if payment is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if payment["provider"] != "manual":
+        raise HTTPException(status_code=400, detail="Online payments are confirmed only by the payment provider")
+    result = billing.mark_paid(conn, payment["reference"], confirmed_by=user.id)
+    audit.platform(conn, user, "PAYMENT_CONFIRMED_MANUALLY", payment["organization_id"], "payment", payment_id,
+                   {"reference": payment["reference"], "amount": payment["amount"], "currency": payment["currency"],
+                    "purpose": payment["purpose"]}, reason=body.note)
+    conn.commit()
+    set_organization(conn, user.organization_id)
+    return result
+
+
+class CreditGrant(BaseModel):
+    change: int = Field(ge=-1_000_000, le=1_000_000)
+    reason: str = Field(pattern="^(GRANT|CORRECTION|REFUND)$")
+    note: str = Field(min_length=3, max_length=300)
+
+
+@router.post("/organizations/{organization_id}/credits")
+def platform_grant_credits(organization_id: int, body: CreditGrant, user: CurrentUser = Depends(require_step_up),
+                           conn: psycopg.Connection = Depends(get_db)):
+    from ..services import billing
+    if body.change == 0:
+        raise HTTPException(status_code=400, detail="Change must not be zero")
+    billing.add_credits(conn, organization_id, body.change, body.reason, created_by=user.id, note=body.note)
+    audit.platform(conn, user, "MESSAGING_CREDITS_ADJUSTED", organization_id, "messaging_credit_ledger", None,
+                   {"change": body.change, "reason_code": body.reason}, reason=body.note)
+    set_organization(conn, organization_id)
+    balance = billing.credit_balance(conn)
+    set_organization(conn, user.organization_id)
+    conn.commit()
+    return {"organization_id": organization_id, "balance": balance}
+
+
+@router.get("/usage")
+def platform_usage(user: CurrentUser = Depends(require_platform_admin), conn: psycopg.Connection = Depends(get_db)):
+    """Per organization: plan, limits, usage, messages this month, credits.
+    Tenant tables are read one organization at a time (row level security)."""
+    from ..services import billing, plans
+    result = []
+    for org in conn.execute("SELECT * FROM organizations ORDER BY id").fetchall():
+        set_organization(conn, org["id"])
+        counts = conn.execute(
+            """
+            SELECT (SELECT COUNT(*) FROM users WHERE organization_id = %s AND is_active) AS active_users,
+                   (SELECT COUNT(*) FROM locations WHERE is_active) AS active_locations,
+                   (SELECT COUNT(*) FROM medicines) AS medicines,
+                   (SELECT COUNT(*) FROM scheduled_reports) AS scheduled_reports,
+                   (SELECT COUNT(*) FROM notification_deliveries
+                     WHERE created_at >= date_trunc('month', CURRENT_DATE) AND status = 'SENT') AS messages_this_month,
+                   (SELECT COUNT(*) FROM dispensations WHERE dispensed_at >= CURRENT_DATE - 30) AS sales_30_days
+            """,
+            (org["id"],),
+        ).fetchone()
+        result.append({
+            "organization_id": org["id"], "name": org["name"], "status": org["status"],
+            "subscription_status": org["subscription_status"], "messaging_mode": org["messaging_mode"],
+            **plans.effective(conn, org), "usage": counts, "credit_balance": billing.credit_balance(conn),
+        })
+    set_organization(conn, user.organization_id)
+    return result

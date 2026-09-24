@@ -14,7 +14,7 @@ from ..database import get_db
 from ..pagination import set_total
 from ..schemas import Email, Name150, Phone, blank_to_none
 from ..security import CurrentUser, require, require_feature
-from ..services import delivery, scheduler
+from ..services import delivery, plans, scheduler
 
 router = APIRouter(tags=["Notification delivery"])
 
@@ -178,6 +178,8 @@ def create_schedule(body: ScheduleBody, user: CurrentUser = Depends(_scheduling(
                     conn: psycopg.Connection = Depends(get_db)):
     from psycopg.types.json import Jsonb
 
+    plans.check_limit(conn, user.organization_id, "max_scheduled_reports",
+                      conn.execute("SELECT COUNT(*) AS n FROM scheduled_reports").fetchone()["n"])
     data = _clean(body)
     row = conn.execute(
         f"""

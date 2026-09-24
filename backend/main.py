@@ -27,9 +27,10 @@ from .migrate import pending_migrations
 from .ratelimit import SlidingWindow
 from .security import SESSION_COOKIE, client_ip, request_token
 from .routers import (
-    admin, analytics, assistant, auth, barcode, delivery, dispensing, inventory, medicines, organizations,
+    admin, analytics, assistant, auth, barcode, billing, delivery, dispensing, inventory, medicines, organizations,
     platform, purchasing, reports, stock, suppliers, transfers, users,
 )
+from .services import billing as billing_service
 from .services import delivery as delivery_service
 from .services import notifications, scheduler
 
@@ -104,6 +105,10 @@ def _refresh_notifications() -> None:
     try:
         with database.pool.connection() as conn:
             organization_ids = database.active_organization_ids(conn)
+            expired = billing_service.expire_due(conn)
+            conn.commit()
+        if expired:
+            logger.info("Subscriptions / trials ended: %s organization(s)", expired)
         for organization_id in organization_ids:
             with database.organization_connection(organization_id) as conn:
                 result = notifications.refresh(conn)
@@ -421,7 +426,7 @@ def metrics(request: Request):
     return Response(observability.metrics.render(extra), media_type="text/plain; version=0.0.4")
 
 
-for module in (auth, users, organizations, platform, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,
+for module in (auth, users, organizations, platform, billing, medicines, barcode, inventory, stock, dispensing, transfers, suppliers, purchasing,
                analytics, reports, delivery, admin, assistant):
     app.include_router(module.router)
 
