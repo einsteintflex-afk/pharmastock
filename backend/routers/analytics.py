@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ..database import get_db
 from ..security import CurrentUser, require, require_feature
-from ..services import analytics, trends
+from ..services import analytics, intelligence, trends
 
 router = APIRouter(tags=["Analytics"])
 
@@ -164,3 +164,35 @@ def purchasing_trends(months: int = Query(default=12, ge=1, le=36),
                       user: CurrentUser = Depends(require_feature("advanced_analytics", "analytics.read")),
                       conn: psycopg.Connection = Depends(get_db)):
     return trends.purchasing_trends(conn, months)
+
+
+# ------------------------------------------------------------
+# Command center: what needs attention, daily brief, movers, search
+# ------------------------------------------------------------
+
+@router.get("/attention")
+def attention(user: CurrentUser = Depends(require("inventory.read")), conn: psycopg.Connection = Depends(get_db)):
+    return intelligence.attention(conn, user)
+
+
+@router.get("/daily-brief")
+def daily_brief(user: CurrentUser = Depends(require("analytics.read")), conn: psycopg.Connection = Depends(get_db)):
+    return intelligence.daily_brief(conn, user)
+
+
+@router.get("/analytics/movers")
+def movers(dead_days: int = Query(default=180, ge=30, le=730),
+           user: CurrentUser = Depends(require("analytics.read")), conn: psycopg.Connection = Depends(get_db)):
+    return intelligence.movers(conn, dead_days)
+
+
+@router.get("/analytics/stockout-risk")
+def stockout_risk(days: int = Query(default=7, ge=1, le=90),
+                  user: CurrentUser = Depends(require("analytics.read")), conn: psycopg.Connection = Depends(get_db)):
+    return intelligence.stockout_risk(conn, days)
+
+
+@router.get("/search")
+def global_search(q: str = Query(min_length=2, max_length=100), user: CurrentUser = Depends(require("inventory.read")),
+                  conn: psycopg.Connection = Depends(get_db)):
+    return intelligence.search(conn, user, q)

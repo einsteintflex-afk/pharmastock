@@ -463,6 +463,84 @@ def stockout_report(conn, currency, **_) -> Report:
                   + [("Note", note) for note in data["limitations"]])
 
 
+def out_of_stock_report(conn, currency, **_) -> Report:
+    reorder = {r["medicine_id"]: r for r in analytics.reorder_recommendations(conn)}
+    rows = []
+    for item in inventory.medicine_stock(conn):
+        if item["is_active"] and item["usable_stock"] == 0:
+            r = reorder.get(item["medicine_id"], {})
+            rows.append({"medicine": item["medicine"], "strength": item["strength"], "dosage_form": item["dosage_form"],
+                         "expired_stock": item["expired_stock"], "reorder_level": item["reorder_level"],
+                         "on_order": r.get("on_order", 0), "average_daily": r.get("average_daily_consumption", 0),
+                         "recommended_quantity": r.get("recommended_quantity", 0)})
+    columns = [("medicine", "Medicine", "text"), ("strength", "Strength", "text"), ("dosage_form", "Form", "text"),
+               ("expired_stock", "Expired units held", "int"), ("reorder_level", "Reorder level", "int"),
+               ("on_order", "On order", "int"), ("average_daily", "Daily use", "number"),
+               ("recommended_quantity", "Suggested order", "int")]
+    return Report("out-of-stock", "Out-of-Stock Report", columns, rows,
+                  subtitle="Active medicines with no usable stock now",
+                  summary=[("Medicines out of stock", str(len(rows))),
+                           ("Already on order", str(sum(1 for r in rows if r["on_order"])))])
+
+
+def fast_moving_report(conn, currency, **_) -> Report:
+    from . import intelligence
+    data = intelligence.movers(conn)
+    columns = [("medicine", "Medicine", "text"), ("strength", "Strength", "text"),
+               ("units_dispensed_last_90_days", "Units (90 d)", "int"), ("share_percent", "Share %", "number"),
+               ("average_daily_consumption", "Daily use", "number"), ("usable_stock", "Usable stock", "int"),
+               ("trend", "Trend", "text")]
+    return Report("fast-moving", "Fast-Moving Medicines", columns, data["fast"], subtitle=data["method"],
+                  summary=[("Fast movers", str(len(data["fast"]))),
+                           ("Units dispensed (90 days)", f"{data['units_dispensed_90d']:,}"),
+                           ("Dead stock lines", str(len(data["dead"])))])
+
+
+def stock_count_report(conn, currency, date_from=None, date_to=None, **_) -> Report:
+    date_from, date_to = _period(date_from, date_to, 90)
+    rows = conn.execute(
+        """
+        SELECT c.count_number, c.name, l.name AS location, c.status, c.created_at, c.posted_at,
+               COUNT(cl.id) AS lines,
+               COUNT(cl.id) FILTER (WHERE cl.counted_quantity <> cl.system_quantity) AS lines_with_variance,
+               COALESCE(SUM(cl.counted_quantity - cl.system_quantity) FILTER (WHERE cl.counted_quantity > cl.system_quantity), 0) AS units_over,
+               COALESCE(-SUM(cl.counted_quantity - cl.system_quantity) FILTER (WHERE cl.counted_quantity < cl.system_quantity), 0) AS units_short,
+               ROUND(COALESCE(SUM((cl.counted_quantity - cl.system_quantity) * b.unit_cost), 0), 2) AS variance_value
+        FROM stock_counts c JOIN locations l ON l.id = c.location_id
+        LEFT JOIN stock_count_lines cl ON cl.stock_count_id = c.id LEFT JOIN batches b ON b.id = cl.batch_id
+        WHERE c.created_at >= %s AND c.created_at < %s::date + 1
+        GROUP BY c.id, l.name ORDER BY c.id DESC
+        """, (date_from, date_to)).fetchall()
+    columns = [("count_number", "Count", "text"), ("name", "Name", "text"), ("location", "Location", "text"),
+               ("status", "Status", "text"), ("created_at", "Started", "datetime"), ("posted_at", "Posted", "datetime"),
+               ("lines", "Lines", "int"), ("lines_with_variance", "With variance", "int"),
+               ("units_over", "Units over", "int"), ("units_short", "Units short", "int"),
+               ("variance_value", "Variance value", "money")]
+    return Report("stock-counts", "Stock Count Report", columns, rows, subtitle=f"{date_from} to {date_to}",
+                  summary=[("Counts", str(len(rows))),
+                           ("Net variance value (costed lines)", f"{currency}{_money(sum(float(r['variance_value']) for r in rows))}")])
+
+
+def adjustment_report(conn, currency, date_from=None, date_to=None, location_id=None, **_) -> Report:
+    from . import adjustments
+    date_from, date_to = _period(date_from, date_to, 30)
+    rows = adjustments.search(conn, date_from=date_from, date_to=date_to, location_id=location_id, limit=10000)
+    for row in rows:
+        row["reason"] = adjustments.REASON_CODES.get(row["reason_code"], row["reason_code"])
+    columns = [("adjustment_number", "Adjustment", "text"), ("requested_at", "Date", "datetime"),
+               ("medicine", "Medicine", "text"), ("batch_number", "Batch", "text"), ("location", "Location", "text"),
+               ("previous_quantity", "Before", "int"), ("adjustment_quantity", "Change", "int"),
+               ("new_quantity", "After", "int"), ("value", "Value", "money"), ("reason", "Reason", "text"),
+               ("status", "Status", "text"), ("requested_by_name", "Requested by", "text"),
+               ("decided_by_name", "Approved / decided by", "text"), ("notes", "Notes", "text")]
+    posted = [r for r in rows if r["status"] == "POSTED"]
+    return Report("adjustments", "Stock Adjustment Report", columns, rows, subtitle=f"{date_from} to {date_to}",
+                  summary=[("Adjustments", str(len(rows))), ("Posted", str(len(posted))),
+                           ("Units removed", f"{-sum(r['adjustment_quantity'] for r in posted if r['adjustment_quantity'] < 0):,}"),
+                           ("Units added", f"{sum(r['adjustment_quantity'] for r in posted if r['adjustment_quantity'] > 0):,}"),
+                           ("Value adjusted (costed)", f"{currency}{_money(sum(float(r['value'] or 0) for r in posted))}")])
+
+
 REPORTS = {
     "dispensing": ("Dispensing (daily sales)", dispensing_report, ["date_from", "date_to"]),
     "inventory": ("Inventory", inventory_report, ["location_id", "status"]),
@@ -486,6 +564,10 @@ REPORTS = {
     "transfers": ("Transfers & requisitions", transfer_report, ["date_from", "date_to", "location_id"]),
     "locations": ("Stock by location", location_report, []),
     "audit": ("Audit trail", audit_report, ["date_from", "date_to"]),
+    "out-of-stock": ("Out of stock", out_of_stock_report, []),
+    "fast-moving": ("Fast-moving medicines", fast_moving_report, []),
+    "stock-counts": ("Stock counts", stock_count_report, ["date_from", "date_to"]),
+    "adjustments": ("Stock adjustments", adjustment_report, ["date_from", "date_to", "location_id"]),
 }
 
 # Reports that need a permission beyond analytics.read.

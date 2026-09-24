@@ -32,14 +32,14 @@ def assistant_status(user: CurrentUser = Depends(require_feature("ai_assistant",
     return {
         "engine": "claude" if settings.anthropic_api_key else "built-in",
         "model": settings.anthropic_model if settings.anthropic_api_key else None,
-        "tools": list(assistant.TOOLS),
+        "tools": assistant.allowed_tools(user),
     }
 
 
 @router.post("/assistant/ask")
 def ask(body: Question, user: CurrentUser = Depends(require_feature("ai_assistant", "assistant.use")),
         conn: psycopg.Connection = Depends(get_db)):
-    result = assistant.ask(conn, body.question.strip(), [h.model_dump() for h in body.history])
+    result = assistant.ask(conn, body.question.strip(), [h.model_dump() for h in body.history], user)
     audit.record(conn, user, "ASSISTANT_QUERY", "assistant", None, None,
                  {"question": body.question[:500], "engine": result.get("engine"),
                   "tools_used": result.get("tools_used")})

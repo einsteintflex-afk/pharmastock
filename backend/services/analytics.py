@@ -21,6 +21,7 @@ def _settings(conn):
         "slow_units": int(values["stock.slow_moving_units_90d"]),
         "lead_time": int(values["reorder.lead_time_days"]),
         "cover_days": int(values["reorder.cover_days"]),
+        "safety_days": int(values.get("reorder.safety_days", 7)),
     }
 
 
@@ -32,10 +33,13 @@ def reorder_recommendations(conn: psycopg.Connection, *, only_needed: bool = Fal
     """Per medicine: usable stock, consumption rate, days of stock remaining
     and a reorder recommendation.
 
+    safety stock  = daily_rate * safety_days            (buffer against demand / delivery variation)
+    reorder point = daily_rate * lead_time + safety stock
     A reorder is recommended when usable stock is at/below the reorder level
-    or will run out within the supplier lead time. The quantity brings stock
-    (including units already on order) up to
-        max(reorder_level, daily_rate * (lead_time + cover_days)).
+    or at/below the reorder point (it would run into the safety stock before
+    a delivery could arrive). The quantity brings stock (including units
+    already on order) up to
+        max(reorder_level, daily_rate * (lead_time + cover_days) + safety stock).
     """
     cfg = _settings(conn)
     stock = inventory.medicine_stock(conn)
@@ -53,8 +57,11 @@ def reorder_recommendations(conn: psycopg.Connection, *, only_needed: bool = Fal
         days_of_stock = round(usable / daily, 1) if daily > 0 else None
 
         below_level = usable <= item["reorder_level"]
-        runs_out_in_lead_time = days_of_stock is not None and days_of_stock <= cfg["lead_time"]
-        target = max(item["reorder_level"], math.ceil(daily * (cfg["lead_time"] + cfg["cover_days"])))
+        safety_stock = math.ceil(daily * cfg["safety_days"])
+        reorder_point = math.ceil(daily * cfg["lead_time"]) + safety_stock if daily > 0 else None
+        runs_out_in_lead_time = reorder_point is not None and usable <= reorder_point
+        target = max(item["reorder_level"],
+                     math.ceil(daily * (cfg["lead_time"] + cfg["cover_days"])) + safety_stock)
         shortfall = max(0, target - usable - ordered)
 
         needed = (below_level or runs_out_in_lead_time) and shortfall > 0
@@ -65,7 +72,8 @@ def reorder_recommendations(conn: psycopg.Connection, *, only_needed: bool = Fal
             elif below_level:
                 reasons.append(f"usable stock {usable} is at or below reorder level {item['reorder_level']}")
             if runs_out_in_lead_time:
-                reasons.append(f"about {days_of_stock} days of stock left, lead time is {cfg['lead_time']} days")
+                reasons.append(f"at or below the reorder point {reorder_point} (about {days_of_stock} days left; "
+                               f"lead time {cfg['lead_time']} + safety {cfg['safety_days']} days)")
             reason = "; ".join(reasons)
         elif (below_level or runs_out_in_lead_time) and ordered:
             reason = f"low, but {ordered} units already on order"
@@ -84,14 +92,18 @@ def reorder_recommendations(conn: psycopg.Connection, *, only_needed: bool = Fal
             "on_order": ordered,
             "average_daily_consumption": daily,
             "days_of_stock": days_of_stock,
+            "safety_stock": safety_stock,
+            "reorder_point": reorder_point,
             "target_stock": target,
             "reorder_recommended": needed,
             "recommended_quantity": shortfall if needed else 0,
             "reason": reason,
             "projected_stockout_date": (date.today() + timedelta(days=math.floor(days_of_stock)))
             if days_of_stock is not None else None,
-            "calculation": (f"target = max(reorder level {item['reorder_level']}, daily use {daily} x "
-                            f"(lead time {cfg['lead_time']} + cover {cfg['cover_days']} days)) = {target}; "
+            "calculation": (f"safety stock = daily use {daily} x {cfg['safety_days']} days = {safety_stock}; "
+                            f"reorder point = daily use x lead time {cfg['lead_time']} + safety = {reorder_point}; "
+                            f"target = max(reorder level {item['reorder_level']}, daily use x "
+                            f"(lead time {cfg['lead_time']} + cover {cfg['cover_days']} days) + safety) = {target}; "
                             f"suggested = target - usable {usable} - on order {ordered} = {shortfall}"),
         }
         if not only_needed or needed:
